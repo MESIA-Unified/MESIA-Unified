@@ -18,7 +18,7 @@
 
 use std::collections::HashMap;
 use std::mem::offset_of;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 use crate::object::{self, E_INVALIDARG, HRESULT, Iid, Object, PIPELINE, Table, This, guid};
 use crate::resource::PAGEABLE_IIDS;
@@ -501,8 +501,25 @@ fn hand_out(
     out: *mut This,
 ) -> HRESULT {
     tracing::trace!(?shaders, "pipeline state");
+    // Title pipelines with the same key (shaders and state) share the
+    // pending host pipeline rather than making it again.
     #[cfg(windows)]
-    let host = Arc::new(make::Pending::new(shaders.clone(), graphics));
+    let host = {
+        static PENDINGS: Mutex<Option<HashMap<String, Weak<make::Pending>>>> = Mutex::new(None);
+        let key = make::key(&shaders, graphics.as_deref());
+        let mut pendings = PENDINGS.lock().unwrap_or_else(|e| e.into_inner());
+        let pendings = pendings.get_or_insert_with(HashMap::new);
+        match pendings.get(&key).and_then(Weak::upgrade) {
+            Some(p) => p,
+            None => {
+                // A dead entry goes only when its key comes up again.
+                pendings.remove(&key);
+                let p = Arc::new(make::Pending::new(shaders.clone(), graphics));
+                pendings.insert(key, Arc::downgrade(&p));
+                p
+            }
+        }
+    };
     #[cfg(windows)]
     make::early(&host);
     #[cfg(windows)]

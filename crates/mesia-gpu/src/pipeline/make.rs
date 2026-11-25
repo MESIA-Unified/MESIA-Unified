@@ -43,18 +43,12 @@ unsafe impl Sync for Pending {}
 
 impl Pending {
     pub(crate) fn new(shaders: Vec<Arc<Shader>>, graphics: Option<Box<GraphicsState>>) -> Pending {
-        let mut key = blake3::Hasher::new();
-        for s in &shaders {
-            key.update(s.stage.as_bytes());
-            key.update(s.hash.as_bytes());
-        }
-        key.update(graphics.as_ref().map(|g| g.describe()).unwrap_or_default().as_bytes());
         Pending {
+            key: key(&shaders, graphics.as_deref()),
             shaders,
             graphics,
             queue_state: AtomicU8::new(NOT_QUEUED),
             made: OnceLock::new(),
-            key: key.finalize().to_hex()[..32].to_owned(),
             used: AtomicBool::new(false),
         }
     }
@@ -66,6 +60,19 @@ impl Pending {
         let _held = lock.lock().unwrap_or_else(|e| e.into_inner());
         done.notify_all();
     }
+}
+
+/// What identifies a pipeline across runs (shader containers and state):
+/// the `key` `Pending::new` computes, made before one exists so identical
+/// title pipelines can share one (`hand_out`).
+pub(crate) fn key(shaders: &[Arc<Shader>], graphics: Option<&GraphicsState>) -> String {
+    let mut key = blake3::Hasher::new();
+    for s in shaders {
+        key.update(s.stage.as_bytes());
+        key.update(s.hash.as_bytes());
+    }
+    key.update(graphics.map(|g| g.describe()).unwrap_or_default().as_bytes());
+    key.finalize().to_hex()[..32].to_owned()
 }
 
 /// Why a pipeline has no host pipeline (diagnostics): its shaders that do
@@ -310,10 +317,10 @@ fn workers() -> bool {
                     }
                     loop {
                         next().make();
+                        // While work still waits, draining it matters more
+                        // than persisting: the save is left to `drained`.
                         if WAITING.fetch_sub(1, Ordering::Relaxed) == 1 {
                             drained();
-                        } else {
-                            super::library::save(false);
                         }
                     }
                 });
