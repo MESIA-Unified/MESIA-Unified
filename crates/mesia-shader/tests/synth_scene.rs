@@ -22,8 +22,9 @@
 //! the readback, measured; the per-pixel region asserts beside them carry
 //! the check on their own where a driver disagrees on an edge case.
 //!
-//! Skipped without a hardware device or a compiler, like `emit`'s GPU
-//! tests (WARP: see the test).
+//! Skipped without a device or a compiler, like `emit`'s GPU tests; on
+//! WARP (`MESIA_WARP=1`) both frames run and check against the same
+//! goldens.
 
 #![cfg(all(windows, feature = "host"))]
 
@@ -207,6 +208,11 @@ struct Scene {
     vb_fan: ID3D12Resource,
     vb_quad: ID3D12Resource,
     ib: ID3D12Resource,
+    // The RTV heap must stay alive too: `rtv_a`/`rtv_b` are handles into
+    // it, and every command list refers to them. Dropping it while the
+    // handles remain in use leaves them dangling (freed-memory reads in
+    // the driver - WARP's software rasterizer faults on them).
+    rtvs: ID3D12DescriptorHeap,
     views: ID3D12DescriptorHeap,
     readback: ID3D12Resource,
     keep: Vec<ID3D12Resource>,
@@ -417,6 +423,7 @@ impl Scene {
             vb_fan,
             vb_quad,
             ib,
+            rtvs,
             views,
             readback,
             keep: Vec::new(),
@@ -629,7 +636,7 @@ impl Scene {
                 ));
             }
             self.readback.Unmap(0, None);
-            let _ = &self.keep;
+            let _ = (&self.keep, &self.rtvs);
             Ok(out)
         }
     }
@@ -692,7 +699,7 @@ fn hash(image: &[[f32; 4]]) -> u64 {
     h
 }
 
-/// The golden FNV-1a sums of both frames, measured on an RTX 3060 (frame 1
+/// The golden FNV-1a sums of both frames, measured on an RTX 3060 (both
 /// also on WARP, bit-identical) with the 10.0.26100 SDK dxc, ps/vs 6.6; the per-pixel asserts
 /// below remain the load-bearing check where another driver differs.
 const GOLDEN_FRAME_1: u64 = 0x1967_4552_0ce3_4ae5;
@@ -704,15 +711,11 @@ fn synthetic_scene_renders_and_refreshes() {
         eprintln!("no PC dxc; skipped");
         return;
     };
-    // Hardware only: on WARP the second frame's submission faults inside
-    // the software rasterizer (an open issue — the same commands pass on
-    // hardware, bit-identical frame 1 on both). `MESIA_SYNTH_WARP=1` runs
-    // it there anyway, to investigate.
-    let warp = std::env::var_os("MESIA_WARP").is_some_and(|v| v == "1");
-    if warp && std::env::var_os("MESIA_SYNTH_WARP").is_none_or(|v| v != "1") {
-        eprintln!("WARP: second frame faults there (open issue); skipped");
-        return;
-    }
+    // Both frames also run on WARP (`MESIA_WARP=1`). A WARP fault on the
+    // second frame here was this harness's, not the rasterizer's: the RTV
+    // descriptor heap was dropped at the end of `Scene::new`, leaving the
+    // `rtv_a`/`rtv_b` handles the command lists record dangling into freed
+    // memory - see `Scene::rtvs`.
     let Ok(host) = Host::new(false) else {
         eprintln!("no hardware SM 6.6 device; skipped");
         return;
