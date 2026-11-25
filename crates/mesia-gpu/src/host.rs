@@ -1544,6 +1544,19 @@ fn wide_merge() -> bool {
     *ON.get_or_init(|| std::env::var_os("MESIA_WIDE_MERGE").is_some_and(|v| v == "1"))
 }
 
+/// Whether a fetch of what shaders wrote to copies in the card's memory
+/// is merged on the landing thread's next pass instead of right after its
+/// send (`MESIA_DEFER_FETCH=1`; off by default). The fetch queues behind
+/// the submissions sent so far, and waiting for it is most of what the
+/// thread does: run 104's landing thread stood about 275 ms a frame on
+/// fetches. With the merge on the next pass the wait overlaps the thread's
+/// other work — landing flights, readying sends — while the card catches
+/// up.
+fn defer_fetch() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("MESIA_DEFER_FETCH").is_some_and(|v| v == "1"))
+}
+
 /// One declared range of a copy in the card's memory, in a submission.
 struct CardRange {
     shadow: std::sync::Arc<crate::shadow::Shadow>,
@@ -2349,6 +2362,25 @@ struct RelayFetch {
     sent: u64,
     /// Buffer, mapping, bytes.
     buffer: Option<(ID3D12Resource, usize, u64)>,
+    /// With `MESIA_DEFER_FETCH=1`: a fetch sent but not merged yet, landed
+    /// by [`Host::relay_fetch_drain`] on the landing thread's next pass.
+    pending: Option<PendingFetch>,
+}
+
+/// A [`RelayFetch`] send still open ([`defer_fetch`]): its pieces, the
+/// order of the queue it ran behind, and its buffer (kept so a grow for a
+/// later fetch cannot drop the mapping under it).
+struct PendingFetch {
+    /// As `relay_card_back`'s chunks: (the copy, its offsets, where the
+    /// bytes came down from `base`).
+    chunk: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize, u64)>,
+    base: u64,
+    /// The value `RelayFetch::fence` reaches when the fetch has run.
+    sent: u64,
+    /// The order of the queue at the send, for the merge's `fetched_after`.
+    after: u64,
+    /// Buffer, mapping, bytes.
+    buffer: (ID3D12Resource, usize, u64),
 }
 
 /// The thread that lands flights ([`relay`]): as soon as the card has run
@@ -3283,6 +3315,7 @@ impl Host {
                 event,
                 sent: 0,
                 buffer: None,
+                pending: None,
             })
         }
     }
@@ -3297,7 +3330,101 @@ impl Host {
     /// whatever was sent meanwhile, so it may bring a later flight's
     /// bytes, which that flight's landing then finds merged already; and
     /// nothing is sent back up.
+    /// [`relay_card_back`]'s chunk of fetched pieces merges into title
+    /// memory: `data` is where the fetch's bytes came down (a piece lies
+    /// at `at - base` in it), `after` the order of the queue the fetch ran
+    /// behind. Returns the bytes written to title memory.
+    fn relay_merge(
+        &self,
+        chunk: &[(std::sync::Arc<crate::shadow::Shadow>, usize, usize, u64)],
+        after: u64,
+        data: usize,
+        base: u64,
+    ) -> usize {
+        if wide_merge() && chunk.len() >= 8 {
+            // Several pieces at a time, but pieces of a copy, or whose
+            // title ranges touch, keep their order in one job (two copies
+            // can cover the same title bytes).
+            let fetched = data;
+            let written = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let spans: Vec<(usize, usize, usize)> = chunk
+                .iter()
+                .map(|(shadow, lo, hi, _)| {
+                    let (a, b) = shadow.title_range(*lo, *hi);
+                    (std::sync::Arc::as_ptr(shadow) as usize, a, b)
+                })
+                .collect();
+            let jobs: Vec<Box<dyn FnOnce() + Send>> = crate::shadow::merge_groups(&spans)
+                .into_iter()
+                .map(|group| {
+                    let work: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize, u64)> = group
+                        .into_iter()
+                        .map(|p| {
+                            let (s, lo, hi, at) = &chunk[p];
+                            (s.clone(), *lo, *hi, *at)
+                        })
+                        .collect();
+                    let written = written.clone();
+                    Box::new(move || {
+                        let mut title = Vec::new();
+                        let mut n = 0;
+                        for (shadow, lo, hi, at) in work {
+                            // SAFETY: the mapping of the fetched bytes;
+                            // the copy into it has run, and the caller
+                            // waits for this job.
+                            let gpu = unsafe { std::slice::from_raw_parts((fetched + (at - base) as usize) as *const u8, hi - lo) };
+                            n += shadow.card_merge_relay(lo, gpu, after, &mut title);
+                        }
+                        written.fetch_add(n, Ordering::Relaxed);
+                    }) as Box<dyn FnOnce() + Send>
+                })
+                .collect();
+            crate::shadow::wide_run(jobs);
+            written.load(Ordering::Relaxed)
+        } else {
+            let mut title = Vec::new();
+            let mut written = 0;
+            for (shadow, lo, hi, at) in chunk {
+                // SAFETY: the mapping of the fetched bytes; the copy into
+                // it has run.
+                let gpu = unsafe { std::slice::from_raw_parts((data + (*at - base) as usize) as *const u8, hi - lo) };
+                written += shadow.card_merge_relay(*lo, gpu, after, &mut title);
+            }
+            written
+        }
+    }
+
+    /// With `MESIA_DEFER_FETCH=1`: the fetch `pending` holds is waited for
+    /// (by now it has usually run) and its pieces merge as a
+    /// [`relay_card_back`] chunk's do. Without one, nothing to do.
+    fn relay_fetch_drain(&self, f: &mut RelayFetch) {
+        let Some(p) = f.pending.take() else {
+            return;
+        };
+        let waiting = std::time::Instant::now();
+        // SAFETY: the event was set on the fetch's fence value when it was
+        // sent; both are this thread's.
+        unsafe {
+            if f.fence.GetCompletedValue() < p.sent {
+                WaitForSingleObject(f.event, INFINITE);
+            }
+        }
+        let us = waiting.elapsed().as_micros() as u64;
+        RELAY_STATS[3].fetch_add(us, Ordering::Relaxed);
+        crate::shadow::CARD_STATS[6].fetch_add(us, Ordering::Relaxed);
+        let written = self.relay_merge(&p.chunk, p.after, p.buffer.1, p.base);
+        COPY_BACK[1].fetch_add(written as u64, Ordering::Relaxed);
+    }
+
     fn relay_card_back(&self, plans: &[&CardPlan], fetch: &mut Option<RelayFetch>) {
+        // A fetch sent on the last pass may still be open: its pieces
+        // merge now, before this pass's — and before its buffer or list
+        // could be asked for again.
+        if defer_fetch() {
+            if let Some(f) = fetch.as_mut() {
+                self.relay_fetch_drain(f);
+            }
+        }
         let differs = {
             let work = CARD_WORK.lock().unwrap_or_else(|e| e.into_inner());
             work.as_ref().map(|work| (work.differs.1, (work.differs.2 / 4) as usize))
@@ -3373,6 +3500,12 @@ impl Host {
             if end == off {
                 end += 1;
             }
+            // With the deferred merge a sent fetch may still be open: its
+            // pieces merge first — its list is asked for again below, and
+            // its buffer is this fetch's.
+            if defer_fetch() {
+                self.relay_fetch_drain(f);
+            }
             let chunk = &pieces[off..end];
             let base = chunk[0].3;
             f.sent += 1;
@@ -3400,7 +3533,9 @@ impl Host {
                     self.card_sent();
                     self.queue.Signal(&fence, sent)?;
                     fence.SetEventOnCompletion(sent, event)?;
-                    WaitForSingleObject(event, INFINITE);
+                    if !defer_fetch() {
+                        WaitForSingleObject(event, INFINITE);
+                    }
                     Ok(after)
                 })()
             };
@@ -3408,67 +3543,30 @@ impl Host {
                 Ok(after) => after,
                 Err(e) => fail(format_args!("what shaders wrote to the card's memory could not be fetched ({e}, MESIA_RELAY=1)")),
             };
-            let us = waiting.elapsed().as_micros() as u64;
-            RELAY_STATS[3].fetch_add(us, Ordering::Relaxed);
             {
                 use crate::shadow::CARD_STATS;
                 CARD_STATS[3].fetch_add(chunk.len() as u64, Ordering::Relaxed);
                 CARD_STATS[4].fetch_add(room as u64, Ordering::Relaxed);
                 CARD_STATS[5].fetch_add(1, Ordering::Relaxed);
-                CARD_STATS[6].fetch_add(us, Ordering::Relaxed);
             }
-            let written = if wide_merge() && chunk.len() >= 8 {
-                // Several pieces at a time, but pieces of a copy, or
-                // whose title ranges touch, keep their order in one job
-                // (two copies can cover the same title bytes).
-                let fetched = data;
-                let written = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-                let spans: Vec<(usize, usize, usize)> = chunk
-                    .iter()
-                    .map(|(shadow, lo, hi, _)| {
-                        let (a, b) = shadow.title_range(*lo, *hi);
-                        (std::sync::Arc::as_ptr(shadow) as usize, a, b)
-                    })
-                    .collect();
-                let jobs: Vec<Box<dyn FnOnce() + Send>> = crate::shadow::merge_groups(&spans)
-                    .into_iter()
-                    .map(|group| {
-                        let work: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize, u64)> = group
-                            .into_iter()
-                            .map(|p| {
-                                let (s, lo, hi, at) = &chunk[p];
-                                (s.clone(), *lo, *hi, *at)
-                            })
-                            .collect();
-                        let written = written.clone();
-                        Box::new(move || {
-                            let mut title = Vec::new();
-                            let mut n = 0;
-                            for (shadow, lo, hi, at) in work {
-                                // SAFETY: the mapping of the fetched
-                                // bytes; the copy into it has run, and
-                                // the caller waits for this job.
-                                let gpu = unsafe { std::slice::from_raw_parts((fetched + (at - base) as usize) as *const u8, hi - lo) };
-                                n += shadow.card_merge_relay(lo, gpu, after, &mut title);
-                            }
-                            written.fetch_add(n, Ordering::Relaxed);
-                        }) as Box<dyn FnOnce() + Send>
-                    })
-                    .collect();
-                crate::shadow::wide_run(jobs);
-                written.load(Ordering::Relaxed)
+            if defer_fetch() {
+                // No wait: the pieces merge on the next pass, when the
+                // card has caught up (the buffer goes with them: a grow
+                // for a later fetch cannot take its mapping).
+                f.pending = Some(PendingFetch {
+                    chunk: chunk.to_vec(),
+                    base,
+                    sent,
+                    after,
+                    buffer: (buffer.clone(), data, cap),
+                });
             } else {
-                let mut title = Vec::new();
-                let mut written = 0;
-                for (shadow, lo, hi, at) in chunk {
-                    // SAFETY: the mapping of the fetched bytes; the copy
-                    // into it has run.
-                    let gpu = unsafe { std::slice::from_raw_parts((data + (*at - base) as usize) as *const u8, hi - lo) };
-                    written += shadow.card_merge_relay(*lo, gpu, after, &mut title);
-                }
-                written
-            };
-            COPY_BACK[1].fetch_add(written as u64, Ordering::Relaxed);
+                let us = waiting.elapsed().as_micros() as u64;
+                RELAY_STATS[3].fetch_add(us, Ordering::Relaxed);
+                crate::shadow::CARD_STATS[6].fetch_add(us, Ordering::Relaxed);
+                let written = self.relay_merge(chunk, after, data, base);
+                COPY_BACK[1].fetch_add(written as u64, Ordering::Relaxed);
+            }
             off = end;
         }
         // Sends up to `after` are of no use to any later merge.
