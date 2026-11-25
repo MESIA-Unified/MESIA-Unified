@@ -3,7 +3,10 @@ param(
     [Parameter(Mandatory = $true)][string]$Game,
     [string]$Cache = "$env:LOCALAPPDATA\mesia\cache",
     [string]$Data = "$env:LOCALAPPDATA\mesia\data",
-    [string]$Exe = "$PSScriptRoot\..\target\release\mesia.exe"
+    [string]$Exe = "$PSScriptRoot\..\target\release\mesia.exe",
+    # -Fast: fluidity over fidelity (fewer texture refreshes, plainer
+    # copies, no guard holes). Textures may go stale.
+    [switch]$Fast
 )
 foreach ($v in "MESIA_KEYS", "MESIA_CAPTURE", "MESIA_CAPTURE_FRAMES", "MESIA_DUMP_TARGETS") {
     Remove-Item "Env:$v" -ErrorAction SilentlyContinue
@@ -25,5 +28,10 @@ $env:MESIA_JOIN_COPIES = "1"
 $env:MESIA_CARD_REHASH_RUNS = "1"
 $env:MESIA_WAVE_WIDE = "0"
 $env:MESIA_PIPELINE_WORKERS = "12"
+if ($Fast) {
+    $env:MESIA_COPY_MODE = "plain"        # no guarded-copy journal
+    $env:MESIA_GUARD_HOLES = "0"          # skip VirtualQuery hole scans
+    $env:MESIA_UNWATCHED_FRAMES = "4"     # unwatched whole-copies every 4th frame
+}
 & $Exe run $Game --execute 2>&1 | Out-File "$env:TEMP\mesia.log" -Encoding utf8
 Write-Host "Exited with $LASTEXITCODE; log: $env:TEMP\mesia.log"
