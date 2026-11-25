@@ -3379,14 +3379,57 @@ impl Host {
             CARD_STATS[5].fetch_add(1, Ordering::Relaxed);
             CARD_STATS[6].fetch_add(us, Ordering::Relaxed);
         }
-        let mut title = Vec::new();
-        let mut written = 0;
-        for (shadow, lo, hi, at) in &pieces {
-            // SAFETY: the mapping of the fetched bytes, `total` of them;
-            // the copy into it has run.
-            let gpu = unsafe { std::slice::from_raw_parts((data + *at as usize) as *const u8, hi - lo) };
-            written += shadow.card_merge_relay(*lo, gpu, after, &mut title);
-        }
+        let written = if wide_merge() && pieces.len() >= 8 {
+            // Several pieces at a time, but pieces of a copy, or whose
+            // title ranges touch, keep their order in one job (two
+            // copies can cover the same title bytes).
+            let fetched = data;
+            let written = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let spans: Vec<(usize, usize, usize)> = pieces
+                .iter()
+                .map(|(shadow, lo, hi, _)| {
+                    let (a, b) = shadow.title_range(*lo, *hi);
+                    (std::sync::Arc::as_ptr(shadow) as usize, a, b)
+                })
+                .collect();
+            let jobs: Vec<Box<dyn FnOnce() + Send>> = crate::shadow::merge_groups(&spans)
+                .into_iter()
+                .map(|group| {
+                    let chunk: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize, u64)> = group
+                        .into_iter()
+                        .map(|p| {
+                            let (s, lo, hi, at) = &pieces[p];
+                            (s.clone(), *lo, *hi, *at)
+                        })
+                        .collect();
+                    let written = written.clone();
+                    Box::new(move || {
+                        let mut title = Vec::new();
+                        let mut n = 0;
+                        for (shadow, lo, hi, at) in chunk {
+                            // SAFETY: the mapping of the fetched bytes;
+                            // the copy into it has run, and the caller
+                            // waits for this job.
+                            let gpu = unsafe { std::slice::from_raw_parts((fetched + at as usize) as *const u8, hi - lo) };
+                            n += shadow.card_merge_relay(lo, gpu, after, &mut title);
+                        }
+                        written.fetch_add(n, Ordering::Relaxed);
+                    }) as Box<dyn FnOnce() + Send>
+                })
+                .collect();
+            crate::shadow::wide_run(jobs);
+            written.load(Ordering::Relaxed)
+        } else {
+            let mut title = Vec::new();
+            let mut written = 0;
+            for (shadow, lo, hi, at) in &pieces {
+                // SAFETY: the mapping of the fetched bytes, `total` of them;
+                // the copy into it has run.
+                let gpu = unsafe { std::slice::from_raw_parts((data + *at as usize) as *const u8, hi - lo) };
+                written += shadow.card_merge_relay(*lo, gpu, after, &mut title);
+            }
+            written
+        };
         COPY_BACK[1].fetch_add(written as u64, Ordering::Relaxed);
         // Sends up to `after` are of no use to any later merge.
         crate::shadow::relay_fetched(after);

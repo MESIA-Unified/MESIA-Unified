@@ -1277,24 +1277,51 @@ pub(crate) fn merge_groups(spans: &[(usize, usize, usize)]) -> Vec<Vec<usize>> {
         r
     }
     let mut root: Vec<usize> = (0..spans.len()).collect();
-    for i in 0..spans.len() {
-        for j in i + 1..spans.len() {
-            let (pi, ai, bi) = spans[i];
-            let (pj, aj, bj) = spans[j];
-            if pi == pj || (ai < bj && aj < bi) {
-                let (ra, rb) = (root_of(&mut root, i), root_of(&mut root, j));
-                if ra != rb {
-                    root[ra.max(rb)] = ra.min(rb);
-                }
+    let union = |root: &mut Vec<usize>, a: usize, b: usize| {
+        let (ra, rb) = (root_of(root, a), root_of(root, b));
+        if ra != rb {
+            root[ra.max(rb)] = ra.min(rb);
+        }
+    };
+    // Spans of one copy are one group, whatever their ranges.
+    let mut by_copy: std::collections::HashMap<usize, usize> = std::collections::HashMap::new();
+    for (i, &(p, ..)) in spans.iter().enumerate() {
+        match by_copy.get(&p) {
+            Some(&first) => union(&mut root, first, i),
+            None => {
+                by_copy.insert(p, i);
             }
         }
     }
+    // Overlapping title ranges are one group: a start-sorted sweep keeps
+    // the still-open intervals (disjoint, so sorted by end as by start);
+    // a new span unions with every open one it touches — the first whose
+    // end passes its start and every one after — and they stay open as the
+    // merged interval, which the member that reaches farthest stands for.
+    let mut order: Vec<usize> = (0..spans.len()).collect();
+    order.sort_unstable_by_key(|&i| spans[i].1);
+    let mut open: Vec<(usize, usize)> = Vec::new(); // (end, index)
+    for &i in &order {
+        let (_, a, b) = spans[i];
+        let first = open.partition_point(|&(e, _)| e <= a);
+        let mut end = b;
+        for k in first..open.len() {
+            union(&mut root, open[k].1, i);
+            end = end.max(open[k].0);
+        }
+        open.truncate(first);
+        open.push((end, i));
+    }
     let mut groups: Vec<(usize, Vec<usize>)> = Vec::new();
+    let mut place: std::collections::HashMap<usize, usize> = std::collections::HashMap::new();
     for i in 0..spans.len() {
         let r = root_of(&mut root, i);
-        match groups.iter_mut().find(|(g, _)| *g == r) {
-            Some((_, items)) => items.push(i),
-            None => groups.push((r, vec![i])),
+        match place.get(&r) {
+            Some(&k) => groups[k].1.push(i),
+            None => {
+                place.insert(r, groups.len());
+                groups.push((r, vec![i]));
+            }
         }
     }
     groups.into_iter().map(|(_, items)| items).collect()
@@ -2859,6 +2886,12 @@ impl Shadow {
     /// The offsets of piece `i` of `span` that lie in the span.
     pub(crate) fn card_piece(&self, span: &CardSpan, i: u32) -> (usize, usize) {
         card_piece_of(self.start as usize, self.len as usize, span, i)
+    }
+
+    /// The title addresses of copy offsets `[lo, hi)` (for grouping
+    /// merges by the title bytes they touch).
+    pub(crate) fn title_range(&self, lo: usize, hi: usize) -> (usize, usize) {
+        (self.start as usize + lo, self.start as usize + hi)
     }
 
     /// After a submission, for a copy in the card's memory: `gpu` is what
