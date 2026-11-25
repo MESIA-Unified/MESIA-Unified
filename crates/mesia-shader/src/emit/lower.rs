@@ -1262,6 +1262,7 @@ impl<'a> Lower<'a> {
                 let n = i.name();
                 n.starts_with("ds_swizzle")
                     || n.contains("permute")
+                    || n.starts_with("v_permlane")
                     || n.starts_with("v_mbcnt")
                     || matches!(n, "v_readlane_b32" | "v_writelane_b32")
                     || matches!(&i.fields, Fields::Valu(v) if v.dpp.is_some())
@@ -7269,6 +7270,62 @@ impl<'a> Lower<'a> {
                 }
                 Ok(())
             }
+            "v_permlane16_b32" | "v_permlanex16_b32" => {
+                // An arbitrary gather inside the lane's 32-lane half: the lane of
+                // a 16-lane row it reads is nibble lane&15 of {src2, src1} – of
+                // its own row, of the other row of the half for the x form. The
+                // ISA confines the fetch to the half, so a console wave run as
+                // two host waves needs no exchange for it (each host wave is one
+                // half). The opsel bits are fi (fetch lanes with EXEC off as the
+                // value they hold) and bound_ctrl (an EXEC-off source lane reads
+                // 0; with neither the read keeps the destination's old value).
+                self.cross_lane(false)?;
+                let (x, s1, s2) = (s(self, 0)?, s(self, 1)?, s(self, 2)?);
+                let [n0, n2, n7, n8, n15, n16, nhi] =
+                    [0u32, 2, 7, 8, 15, 16, !15].map(|n| self.s.m.i32(n));
+                let lane = self.lane_index();
+                let pos = self.s.m.bin(c, Bin::And, lane, n15);
+                let low = self.s.m.cmp(c, pred::IULT, pos, n8);
+                let sh = self.s.m.bin(c, Bin::And, pos, n7);
+                let sh = self.s.m.bin(c, Bin::Shl, sh, n2);
+                let word = self.s.m.select(c, low, s1, s2);
+                let pick = self.s.m.bin(c, Bin::LShr, word, sh);
+                let pick = self.s.m.bin(c, Bin::And, pick, n15);
+                let row = self.s.m.bin(c, Bin::And, lane, nhi);
+                let row = if name == "v_permlanex16_b32" {
+                    self.s.m.bin(c, Bin::Xor, row, n16)
+                } else {
+                    row
+                };
+                let at = self.s.m.bin(c, Bin::Or, row, pick);
+                let r = match (v.opsel & 3, guard) {
+                    // bound_ctrl alone: an EXEC-off source lane reads 0 – each
+                    // lane masks its own value, so the read of one gets 0.
+                    (2, Some(g)) => {
+                        let x = self.s.m.select(c, g, x, n0);
+                        self.read_lane(x, at)
+                    }
+                    // neither: an EXEC-off source lane leaves the read the
+                    // destination's old value. (fi set: the lane's value it is,
+                    // which a wave read gives anyway.)
+                    (0, Some(g)) => {
+                        let got = self.read_lane(x, at);
+                        let gi = self.s.m.cast(c, Cast::ZExt, g, self.s.t.i32);
+                        let on = self.read_lane(gi, at);
+                        let on = self.s.m.cmp(c, pred::NE, on, n0);
+                        let Some(Operand::Vector { reg, .. }) = v.dst else {
+                            return Err("a permute result");
+                        };
+                        let old = match inst.read(Reg::V(reg)) {
+                            Some(o) => self.i32_of(o)?,
+                            None => n0,
+                        };
+                        self.s.m.select(c, on, got, old)
+                    }
+                    _ => self.read_lane(x, at),
+                };
+                int(self, r)
+            }
             "v_readlane_b32" => {
                 let (a, lane) = (s(self, 0)?, s(self, 1)?);
                 // A computed lane in a pixel or vertex program is a host lane
@@ -11230,6 +11287,95 @@ mod tests {
             0,
             "dynamic v_perm_b32 must not require INT64"
         );
+    }
+
+    /// `v_permlanex16_b32` / `v_permlane16_b32`: a gather inside the lane's
+    /// 32-lane half — nibble lane&15 of {src2, src1} names the lane of the
+    /// other (x) or the same 16-lane row it reads. It lowers to a wave
+    /// lane read; the fetch never crosses the half, so a console wave64
+    /// program keeps it in host waves of 32 (each is one half) as of 64.
+    #[test]
+    fn a_16_lane_permute_reads_a_lane_of_its_half() {
+        // The thread id is the data (v0); the result in v1 is kept by a
+        // store to LDS. `body` ends before the store.
+        let unguarded: [&[u32]; 2] = [
+            // The compiler's usual: vector data, immediate selects.
+            &[
+                0x7E04_0300, // v_mov_b32 v2, v0
+                0xD778_0001, 0x0201_0102, // v_permlanex16_b32 v1, v2, 0, 0
+            ],
+            // The same-row form, its selects a vector and a scalar.
+            &[
+                0x7E04_0300,             // v_mov_b32 v2, v0
+                0x7E06_02FF, 0x7654_3210, // v_mov_b32 v3, 0x76543210
+                0xD777_0001, 0x000A_0702, // v_permlane16_b32 v1, v2, v3, s2
+            ],
+        ];
+        let layout = || vec![root(RootType::Constants, 0, 0)];
+        for wave64 in [false, true] {
+            // Around the gather, EXEC is narrowed: the opsel bits (fi,
+            // bound_ctrl) say what a read of a lane with EXEC off gives.
+            let (save, restore) = if wave64 {
+                (0xBE8C_246A, 0xBEFE_040C) // s_and_saveexec_b64 s[12:13], vcc; s_mov_b64 exec
+            } else {
+                (0xBE8D_3C6A, 0xBEFE_030D) // s_and_saveexec_b32 s13, vcc_lo; s_mov_b32 exec_lo
+            };
+            let guarded = |w0: u32| -> Vec<u32> {
+                vec![
+                    0x7D88_0084, // v_cmp_gt_u32 vcc, 4, v0
+                    save,
+                    0xBF88_0003, // s_cbranch_execz -> the exec restore
+                    0x7E04_0300, // v_mov_b32 v2, v0
+                    w0,
+                    0x0201_0102, // v_permlanex16_b32 v1, v2, 0, 0
+                    restore,
+                ]
+            };
+            let bodies: Vec<Vec<u32>> = [
+                unguarded[0].to_vec(),
+                unguarded[1].to_vec(),
+                // bound_ctrl: such a read gives 0.
+                guarded(0xD778_1001),
+                // neither bit: it keeps v1's old value.
+                guarded(0xD778_0001),
+            ]
+            .into();
+            for (n, body) in bodies.iter().enumerate() {
+                let words: Vec<u32> = [
+                    body.as_slice(),
+                    &[0xD834_0000, 0x0000_0100, S_ENDPGM][..],
+                ]
+                .concat();
+                // The host's wave: unknown or 64 leaves a console wave64
+                // whole; 32 halves it.
+                for host in [None, Some(32), Some(64)] {
+                    let was = super::TEST_HOST_WAVE.replace(host);
+                    let l = lower_wave(&words, layout(), vec![], wave64);
+                    super::TEST_HOST_WAVE.set(was);
+                    let l = l.unwrap_or_else(|e| {
+                        panic!("body {n}, wave64 {wave64}, host {host:?}: {e:?}")
+                    });
+                    assert!(l.wave_ops, "body {n}: a wave lane read");
+                    assert_eq!(
+                        l.wave_size,
+                        Some(if wave64 && host != Some(32) { 64 } else { 32 }),
+                        "body {n}, wave64 {wave64}, host {host:?}: the pinned wave"
+                    );
+                    let host_dxil = crate::Container::parse(&l.dxil).unwrap();
+                    let sfi0 = host_dxil.part(crate::FourCC::SFI0).unwrap().data;
+                    let features = u64::from_le_bytes(sfi0.try_into().unwrap());
+                    assert_ne!(features & 0x4000, 0, "SFI0 {features:#x}: wave ops");
+                    assert_eq!(features & 0x8000, 0, "SFI0 {features:#x}: no INT64");
+                    // dxil.dll, where there is one, checks the module.
+                    #[cfg(windows)]
+                    if let Ok(mut v) = crate::emit::validator::Validator::load(
+                        crate::emit::validator::Validator::default_path().as_deref(),
+                    ) {
+                        v.validate(&mut l.dxil.clone()).unwrap();
+                    }
+                }
+            }
+        }
     }
 
     #[test]
