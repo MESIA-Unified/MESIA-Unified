@@ -90,3 +90,6 @@ Correct : `abort` doit sauter à `out` (sortie du header `t`) **avec les phis re
 - Frame cinématique ~766-826 ms : ~47% GPU (~380 ms) + ~390-590 ms CPU soumetteur (card idle behind us). Côté CPU = la cible Phase 2 (F1: watch/copies/binding, relay_wait ~200 ms).
 - `play.ps1 -Fast` : COPY_MODE=plain, GUARD_HOLES=0, UNWATCHED_FRAMES=4 — 1er essai fluidité>fidélité (textures pouvant stagner).
 - GitHub : tout pushé jusqu'à 62068a3.
+
+## Campagne V4 (reçue) — perf recovery 3-5 fps
+Plan : baseline reproductible (Phase 1) → CPU (watch incrémental, relay_wait, binding) → GPU/shaders → cache → paliers 500/333/250/200 ms → endurance. Handoff : HANDOFF-FPS.md. Ordre d'exécution fixé : mesure → goulot #1 → re-mesure → #2 → #3 → GPU.
