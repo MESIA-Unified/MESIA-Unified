@@ -3603,6 +3603,16 @@ impl<'a> Lower<'a> {
         let twice = self.s.m.bin(e, Bin::Shl, wave, one);
         let base = self.s.m.i32(slot);
         let v = self.s.m.bin(e, Bin::Add, base, twice);
+        // a console wave whose upper half has no threads (group % 64 in 1..=32)
+        // never stores its half of the pair: start both dwords at 0 so the half
+        // that runs reads an empty other half, like the console's absent lanes
+        let lds = self.s.lds();
+        let zero = self.s.m.i32(0);
+        let p0 = self.s.m.element(e, lds, v);
+        self.s.m.store(e, p0, zero);
+        let v1 = self.s.m.bin(e, Bin::Add, v, one);
+        let p1 = self.s.m.element(e, lds, v1);
+        self.s.m.store(e, p1, zero);
         self.pair = Some(v);
         v
     }
