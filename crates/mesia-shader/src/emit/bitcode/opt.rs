@@ -73,6 +73,11 @@ pub(crate) struct Usage {
     pub heap_samplers: bool,
     /// A 64-bit atomic.
     pub atomic64: bool,
+    /// A double-precision float, as a result or an operand.
+    pub doubles: bool,
+    /// A double-precision divide or double<->integer conversion: the
+    /// "11.1 double extensions" feature.
+    pub double_ext: bool,
 }
 
 /// What makes two instructions without an effect the same value.
@@ -460,19 +465,31 @@ impl Module {
                 let (V::Const(x), V::Const(y)) = (a, b) else {
                     return None;
                 };
+                let ty = &self.types[self.consts[x as usize].0 .0 as usize];
                 let (Const::Float(x), Const::Float(y)) =
                     (&self.consts[x as usize].1, &self.consts[y as usize].1)
                 else {
                     return None;
                 };
-                let (x, y) = (f32::from_bits(*x), f32::from_bits(*y));
-                let unordered = x.is_nan() || y.is_nan();
                 // Bits 0-2 of a predicate: equal, greater, less; bit 3:
                 // or unordered.
-                let holds = if unordered {
-                    p & 8 != 0
-                } else {
-                    (p & 1 != 0 && x == y) || (p & 2 != 0 && x > y) || (p & 4 != 0 && x < y)
+                let holds = |unordered: bool, eq: bool, gt: bool, lt: bool| {
+                    if unordered {
+                        p & 8 != 0
+                    } else {
+                        (p & 1 != 0 && eq) || (p & 2 != 0 && gt) || (p & 4 != 0 && lt)
+                    }
+                };
+                let holds = match ty {
+                    TypeDef::Float => {
+                        let (x, y) = (f32::from_bits(*x as u32), f32::from_bits(*y as u32));
+                        holds(x.is_nan() || y.is_nan(), x == y, x > y, x < y)
+                    }
+                    TypeDef::Double => {
+                        let (x, y) = (f64::from_bits(*x), f64::from_bits(*y));
+                        holds(x.is_nan() || y.is_nan(), x == y, x > y, x < y)
+                    }
+                    _ => return None,
                 };
                 Some(self.bool(holds))
             }
@@ -568,12 +585,21 @@ impl Module {
                         }
                         let V::Const(c) = x else { return None };
                         let to_float = matches!(self.types[ty.0 as usize], TypeDef::Float);
+                        let to_double = matches!(self.types[ty.0 as usize], TypeDef::Double);
+                        let from_float = matches!(self.types[from.0 as usize], TypeDef::Float);
+                        let from_double = matches!(self.types[from.0 as usize], TypeDef::Double);
                         match self.consts[c as usize].1 {
                             Const::Int(bits) if to_float && self.int_bits(from) == Some(32) => {
                                 Some(self.f32(bits as u32))
                             }
-                            Const::Float(bits) if self.int_bits(ty) == Some(32) => {
-                                Some(self.int_const(ty, i64::from(bits as i32)))
+                            Const::Int(bits) if to_double && self.int_bits(from) == Some(64) => {
+                                Some(self.f64(bits as u64))
+                            }
+                            Const::Float(bits) if from_float && self.int_bits(ty) == Some(32) => {
+                                Some(self.int_const(ty, i64::from(bits as u32 as i32)))
+                            }
+                            Const::Float(bits) if from_double && self.int_bits(ty) == Some(64) => {
+                                Some(self.int_const(ty, bits as i64))
                             }
                             _ => None,
                         }
@@ -968,6 +994,7 @@ impl Module {
         let mut u = Usage::default();
         let reached = self.reached();
         let wide = |ty: Ty| self.types[ty.0 as usize] == TypeDef::Int(64);
+        let f64t = |ty: Ty| self.types[ty.0 as usize] == TypeDef::Double;
         // The first field of a handle's annotation: its kind, with the UAV
         // bit; the second: the component type and count.
         let annotation = |h: V| -> Option<(i64, i64)> {
@@ -995,8 +1022,23 @@ impl Module {
         for (_, blk) in self.blocks.iter().enumerate().filter(|(b, _)| reached[*b]) {
             for &i in blk.phis.iter().chain(&blk.body) {
                 let inst = &self.insts[i as usize];
+                let mut f64op = false;
                 u.int64 |= wide(inst.ty);
-                for_each_operand(&inst.op, |v| u.int64 |= wide(self.type_of(v)));
+                for_each_operand(&inst.op, |v| {
+                    u.int64 |= wide(self.type_of(v));
+                    f64op |= f64t(self.type_of(v));
+                });
+                u.doubles |= f64t(inst.ty) || f64op;
+                // A divide or a double<->integer conversion is DXIL's "11.1
+                // double extensions" feature (DXC's CollectShaderFlags).
+                u.double_ext |= (f64t(inst.ty) || f64op)
+                    && matches!(
+                        &inst.op,
+                        Op::Cast(
+                            Cast::FpToUi | Cast::FpToSi | Cast::UiToFp | Cast::SiToFp,
+                            _
+                        ) | Op::Bin(Bin::SDiv, ..)
+                    );
                 let Op::Call(f, args) = &inst.op else {
                     continue;
                 };

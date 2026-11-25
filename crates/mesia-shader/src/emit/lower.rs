@@ -3880,6 +3880,44 @@ impl<'a> Lower<'a> {
         Ok(())
     }
 
+    /// An f64 result to its two VGPR dwords: `omod` scales it, `clamp`
+    /// saturates it to [0, 1] (a NaN is 0).
+    fn write_f64(&mut self, inst: &Inst, d: V, guard: Option<V>) -> Result<(), Why> {
+        let Fields::Valu(v) = &inst.fields else {
+            unreachable!()
+        };
+        if Self::sdwa_dst(inst).is_some() {
+            return Err("sub-dword selection on a 64-bit result");
+        }
+        let Some(Operand::Vector { reg, .. }) = v.dst else {
+            return Err("a 64-bit result outside a VGPR");
+        };
+        let c = self.cur;
+        self.s.flags |= flags::DOUBLES | flags::INT64;
+        let mut d = d;
+        match v.omod {
+            0 => {}
+            k => {
+                let factor = [1.0f64, 2.0, 4.0, 0.5][usize::from(k)];
+                let k = self.s.m.f64(factor.to_bits());
+                d = self.s.m.bin(c, Bin::Mul, d, k);
+            }
+        }
+        if v.clamp {
+            let (zero, one) = (self.s.m.f64(0), self.s.m.f64(1.0f64.to_bits()));
+            let nan_or_low = self.s.m.cmp(c, pred::ULT, d, zero);
+            d = self.s.m.select(c, nan_or_low, zero, d);
+            let high = self.s.m.cmp(c, pred::OGT, d, one);
+            d = self.s.m.select(c, high, one, d);
+        }
+        let i64t = self.s.m.int(64);
+        let x = self.s.m.cast(c, Cast::Bitcast, d, i64t);
+        let (lo, hi) = self.split64(x);
+        self.write(inst, Reg::V(reg), lo, guard);
+        self.write(inst, Reg::V(reg + 1), hi, guard);
+        Ok(())
+    }
+
     /// Starts code only the lanes where `guard` holds run (a store under a
     /// lane guard): returns where it started and the join block.
     fn begin_guarded(&mut self, guard: Option<V>) -> Option<(usize, usize)> {
@@ -6998,6 +7036,49 @@ impl<'a> Lower<'a> {
                 let r = self.s.m.cast(c, op, a, self.s.t.f32);
                 float(self, r)
             }
+            "v_cvt_f32_f64" | "v_cvt_i32_f64" | "v_cvt_u32_f64" => {
+                // The f64 source is a register pair (inline constants
+                // widen); the conversions round to nearest even, saturate
+                // and give 0 for NaN, as the hardware does — the f32
+                // forms' semantics.
+                let d = self.f64_src(inst, 0)?;
+                match name {
+                    "v_cvt_f32_f64" => {
+                        let r = self.s.m.cast(c, Cast::FpTrunc, d, self.s.t.f32);
+                        float(self, r)
+                    }
+                    _ => {
+                        let op = if name == "v_cvt_u32_f64" {
+                            Cast::FpToUi
+                        } else {
+                            Cast::FpToSi
+                        };
+                        let r = self.s.m.cast(c, op, d, self.s.t.i32);
+                        self.s.flags |= flags::DOUBLE_EXT;
+                        int(self, r)
+                    }
+                }
+            }
+            "v_cvt_f64_f32" | "v_cvt_f64_i32" | "v_cvt_f64_u32" => {
+                let f64t = self.s.m.double();
+                let d = match name {
+                    "v_cvt_f64_f32" => {
+                        let a = f(self, 0)?;
+                        self.s.m.cast(c, Cast::FpExt, a, f64t)
+                    }
+                    _ => {
+                        let a = s(self, 0)?;
+                        let op = if name == "v_cvt_f64_i32" {
+                            Cast::SiToFp
+                        } else {
+                            Cast::UiToFp
+                        };
+                        self.s.flags |= flags::DOUBLE_EXT;
+                        self.s.m.cast(c, op, a, f64t)
+                    }
+                };
+                self.write_f64(inst, d, guard)
+            }
             "v_fma_mix_f32" | "v_fma_mixlo_f16" | "v_fma_mixhi_f16" => {
                 // Each source is f32, or with op_sel_hi the low (op_sel: high)
                 // f16 half; neg_hi is the absolute value here.
@@ -7377,6 +7458,60 @@ impl<'a> Lower<'a> {
         let hi = self.s.m.bin(c, Bin::LShr, x, k32);
         let hi = self.s.m.cast(c, Cast::Trunc, hi, self.s.t.i32);
         (lo, hi)
+    }
+
+    /// A 64-bit float source, as an f64. Two register dwords joined; an
+    /// inline constant takes the operand's type (an integer code its
+    /// value, a float code its f32 value widened); a literal is the low
+    /// dword (the high one 0). `abs`/`neg` act on its sign bit; the
+    /// sub-dword selections do not apply to a 64-bit operand.
+    fn f64_src(&mut self, inst: &Inst, k: usize) -> Result<V, Why> {
+        let Fields::Valu(v) = &inst.fields else {
+            unreachable!()
+        };
+        if Self::sdwa_src(inst, k).is_some() || v.dpp.is_some() {
+            return Err("sub-dword selection on a 64-bit operand");
+        }
+        let c = self.cur;
+        let i64t = self.s.m.int(64);
+        self.s.flags |= flags::INT64 | flags::DOUBLES;
+        let pair = |l: &mut Self, r: Reg, r1: Reg| -> Result<V, Why> {
+            let lo = l.i32_of(inst.read(r).ok_or("an unread operand")?)?;
+            let hi = l.i32_of(inst.read(r1).ok_or("an unread operand")?)?;
+            Ok(l.join64(lo, hi))
+        };
+        let op = *v.src.get(k).ok_or("a missing operand")?;
+        let mut x = match op {
+            Operand::Vector { reg, .. } => pair(self, Reg::V(reg), Reg::V(reg + 1))?,
+            Operand::Scalar { code, .. } if code != NULL => {
+                pair(self, Reg::S(code), Reg::S(code + 1))?
+            }
+            Operand::Const(k) => {
+                let x = crate::resource::inline(k).ok_or("a special operand")?;
+                let d = if k >= 240 {
+                    f64::from(f32::from_bits(x))
+                } else {
+                    f64::from(x as i32)
+                };
+                self.s.m.int_const(i64t, d.to_bits() as i64)
+            }
+            Operand::Attr { .. } => return Err("an attribute operand"),
+            // The null register and a 32-bit literal: zero-extended.
+            _ => {
+                let x = self.operand(inst, &op)?;
+                self.s.m.cast(c, Cast::ZExt, x, i64t)
+            }
+        };
+        if v.abs >> k & 1 != 0 {
+            let m = self.s.m.int_const(i64t, i64::MAX);
+            x = self.s.m.bin(c, Bin::And, x, m);
+        }
+        if v.neg >> k & 1 != 0 {
+            let m = self.s.m.int_const(i64t, i64::MIN);
+            x = self.s.m.bin(c, Bin::Xor, x, m);
+        }
+        let f64t = self.s.m.double();
+        Ok(self.s.m.cast(c, Cast::Bitcast, x, f64t))
     }
 
     /// Source `k` of a 16-bit operation in the low 16 bits (the rest 0):

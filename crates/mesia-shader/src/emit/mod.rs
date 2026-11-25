@@ -885,7 +885,7 @@ mod tests {
     }
 
     /// A wave64 compute program: `body`, then a store of v1 to a UAV.
-    fn stores_v1(body: &[u32]) -> Result<(), ShaderError> {
+    fn stores_v1(body: &[u32]) -> Result<HostShader, ShaderError> {
         use crate::native::RootParam;
         use crate::{ResourceType, RootType, UsedResource};
         // s_mov_b32 s1, 0; s_load_dwordx4 s[8:11], s[0:1], 0
@@ -928,7 +928,7 @@ mod tests {
         let st = structure::structure(&p).unwrap();
         let container = crate::dxbc::build(&[]);
         let c = Container::parse(&container).unwrap();
-        emit(&c, &native, &p, &st, &io, &res).map(|_| ())
+        emit(&c, &native, &p, &st, &io, &res)
     }
 
     /// The high dword of a wave64 mask rewritten alone (`s_mov_b32 vcc_hi`
@@ -955,6 +955,45 @@ mod tests {
         let exec_hi_saved = [0xBE82_047E, 0xBEFF_0380, 0x7E02_0287];
         for body in [&select_hi[..], &carry_hi, &exec_hi, &exec_hi_saved] {
             assert!(stores_v1(body).is_err(), "{body:x?}");
+        }
+    }
+
+    /// The f64 conversions (`v_cvt_*_f64`, `v_cvt_f64_*`): a register pair
+    /// is an f64's bits. They translate (fpToSi... `sitofp`, `fpext`,
+    /// `fptrunc`); the double-precision feature bit is declared, and for
+    /// the double<->integer forms the "11.1 double extensions" bit.
+    #[test]
+    fn the_f64_conversions_translate() {
+        // (words, SFI0 feature bits expected)
+        let cases: [(&[u32], u64); 9] = [
+            // v_cvt_i32_f64 v1, v[0:1] / v_cvt_u32_f64 v1, v[0:1]
+            (&[0x7E02_0700], 0x21),
+            (&[0x7E02_2B00], 0x21),
+            // v_cvt_f64_i32 v[1:2], v0 / v_cvt_f64_u32 v[1:2], v0
+            (&[0x7E02_0900], 0x21),
+            (&[0x7E02_2D00], 0x21),
+            // v_cvt_f32_f64 v1, v[0:1] / v_cvt_f64_f32 v[1:2], v0
+            (&[0x7E02_1F00], 0x1),
+            (&[0x7E02_2100], 0x1),
+            // The VOP3 forms: v_cvt_f32_f64 v1, v[0:1]; v_cvt_f64_f32
+            // v[1:2], v0 clamp; v_cvt_i32_f64 v1, |v[0:1]| neg.
+            (&[0xD58F_0001, 0x0000_0100], 0x1),
+            (&[0xD590_8001, 0x0000_0100], 0x1),
+            (&[0xD583_0101, 0x2000_0100], 0x21),
+        ];
+        for (body, want) in cases {
+            let out = stores_v1(body).unwrap();
+            let host = Container::parse(&out.dxil).unwrap();
+            let sfi0 = host.part(FourCC::SFI0).unwrap().data;
+            let features = u64::from_le_bytes(sfi0.try_into().unwrap());
+            assert_eq!(features & 0x21, want, "SFI0 {features:#x} for {body:x?}");
+            // dxil.dll, where there is one, checks the module too.
+            #[cfg(windows)]
+            if let Ok(mut v) = super::validator::Validator::load(
+                super::validator::Validator::default_path().as_deref(),
+            ) {
+                v.validate(&mut out.dxil.clone()).unwrap();
+            }
         }
     }
 
