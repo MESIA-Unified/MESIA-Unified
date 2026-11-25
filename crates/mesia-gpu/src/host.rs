@@ -3119,28 +3119,27 @@ impl Host {
         if !crate::shadow::cards() {
             return None;
         }
-        if no_copies() {
-            // Nothing is copied back (`MESIA_COPY_MODE=none`): no compare
-            // runs, and nothing marks a range to send up (the refreshes
-            // that would are off as well).
-            return None;
-        }
         // The ranges this submission's shaders may write, per copy.
         let mut declared: Vec<(Arc<crate::shadow::Shadow>, Vec<(usize, usize)>)> = Vec::new();
-        // Each (copy, range) once, as in `declared_writes`.
-        let mut seen: std::collections::HashSet<(usize, usize, usize)> = std::collections::HashSet::new();
-        for list in runs {
-            for step in &list.deferred().copies {
-                if let Step::GpuWrite(shadow, address, len) = step
-                    && shadow.carded()
-                {
-                    let range = (*address, *address + *len);
-                    if !seen.insert((Arc::as_ptr(shadow) as usize, range.0, range.1)) {
-                        continue;
-                    }
-                    match declared.iter_mut().find(|(s, _)| Arc::ptr_eq(s, shadow)) {
-                        Some((_, ranges)) => ranges.push(range),
-                        None => declared.push((shadow.clone(), vec![range])),
+        if !no_copies() {
+            // With `MESIA_COPY_MODE=none` what shaders wrote never comes
+            // back: no compare runs, but the ranges the title changed are
+            // still sent up below.
+            // Each (copy, range) once, as in `declared_writes`.
+            let mut seen: std::collections::HashSet<(usize, usize, usize)> = std::collections::HashSet::new();
+            for list in runs {
+                for step in &list.deferred().copies {
+                    if let Step::GpuWrite(shadow, address, len) = step
+                        && shadow.carded()
+                    {
+                        let range = (*address, *address + *len);
+                        if !seen.insert((Arc::as_ptr(shadow) as usize, range.0, range.1)) {
+                            continue;
+                        }
+                        match declared.iter_mut().find(|(s, _)| Arc::ptr_eq(s, shadow)) {
+                            Some((_, ranges)) => ranges.push(range),
+                            None => declared.push((shadow.clone(), vec![range])),
+                        }
                     }
                 }
             }
@@ -5765,9 +5764,10 @@ fn copy_mode() -> u8 {
     })
 }
 
-/// Whether copies of title memory are skipped (`MESIA_COPY_MODE=none`):
-/// refreshes only ask the write watch (the copies are not made), and
-/// nothing goes back — no snapshots, compares, fetches or merges.
+/// Whether what shaders wrote is never put back into title memory
+/// (`MESIA_COPY_MODE=none`): no snapshots, compares, fetches or merges.
+/// Refreshes still copy title memory into the host copies — without them
+/// the card's buffers stay empty and the frame renders black.
 pub(crate) fn no_copies() -> bool {
     copy_mode() == 2
 }
@@ -5790,7 +5790,6 @@ pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: b
             unsafe { std::ptr::copy(src, dst, len) };
             return;
         }
-        2 => return,
         _ => {}
     }
     if len == 0 {

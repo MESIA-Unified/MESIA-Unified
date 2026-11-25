@@ -3124,23 +3124,6 @@ impl Shadow {
     /// [`Shadow::update`] of `[from, to)` (inside the buffer) where no
     /// shader writes.
     fn update_free(&self, from: usize, to: usize) -> usize {
-        if crate::host::no_copies() {
-            // `MESIA_COPY_MODE=none`: nothing is copied. The asking only
-            // keeps the flag that says whether this memory is
-            // write-watched — what is not stays out of the ahead askings
-            // (a range that is not watched costs the asking every flush).
-            if self.watched.load(Ordering::Relaxed) != NOT_WATCHED {
-                self.watched.store(
-                    if crate::watch::probed(from, to).is_some() {
-                        1
-                    } else {
-                        NOT_WATCHED
-                    },
-                    Ordering::Relaxed,
-                );
-            }
-            return 0;
-        }
         if self.watched.load(Ordering::Relaxed) != NOT_WATCHED {
             if let Some((now, written)) = crate::watch::writes(from, to, true) {
                 self.watched.store(1, Ordering::Relaxed);

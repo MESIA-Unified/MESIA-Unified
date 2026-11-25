@@ -377,29 +377,6 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
     ))
 }
 
-/// Whether `[start, end)` is write-watched memory: the asking's number, as
-/// [`writes`] would give it, but with no written pages collected — for a
-/// caller that asks only whether the memory is watched at all (a refresh
-/// that copies nothing). `None` where the kernel would say it is not
-/// (view memory included: nothing is guarded for a copy never made).
-pub(crate) fn probed(start: usize, end: usize) -> Option<u64> {
-    let (first, last) = (start / PAGE, end.div_ceil(PAGE));
-    let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
-    let j = &mut *j;
-    // Asked ahead with the submission's other ranges: the journal has it.
-    if j.ahead.iter().any(|&(a, b)| a <= first && last <= b) {
-        return Some(j.ahead_asked);
-    }
-    // Numbered as `writes` numbers a kernel asking: written pages the
-    // kernel reports are noted under it (they are not collected here).
-    let now = j.asked + 1;
-    if !ask_kernel(j, first, last, now) {
-        return None;
-    }
-    j.asked = now;
-    Some(now)
-}
-
 /// Guarded blocks of view memory.
 const BLOCK: usize = PAGE;
 
