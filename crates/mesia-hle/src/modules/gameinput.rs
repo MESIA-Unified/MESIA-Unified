@@ -107,7 +107,7 @@ const _: () = assert!(size_of::<KeyState>() == 12 && size_of::<PadState>() == 28
 
 /// The host mouse between two polls: how far the cursor travelled (right
 /// and up positive), and which buttons are held.
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy, Debug, Default)]
 struct MouseState {
     dx: f32,
     dy: f32,
@@ -259,7 +259,7 @@ impl Device {
     }
 }
 
-#[derive(PartialEq)]
+#[derive(Debug, PartialEq)]
 enum Value {
     Pad(PadState),
     Keys(Vec<KeyState>),
@@ -521,6 +521,7 @@ impl State {
         if let Some(value) = value
             && (!was || slot.history.back().is_none_or(|r| r.value != value))
         {
+            tracing::debug!(device = index, value = ?value, "new reading");
             slot.sequence += 1;
             if slot.history.len() == HISTORY {
                 slot.history.pop_front();
@@ -707,6 +708,13 @@ fn relative(
             .filter(|r| r.sequence < reference.sequence)
             .find(wanted)
     };
+    tracing::debug!(
+        kind = format_args!("{kind:#x}"),
+        device = index,
+        forward,
+        sequence = found.map(|r| r.sequence),
+        "relative reading"
+    );
     hand(out, found)
 }
 extern "system" fn next_reading(
@@ -740,7 +748,9 @@ extern "system" fn temporal_reading(
     };
     let state = hub.state();
     let history = &state.slots[index].history;
-    hand(out, history.iter().rev().find(|r| r.timestamp <= time))
+    let found = history.iter().rev().find(|r| r.timestamp <= time);
+    tracing::debug!(device = index, time, sequence = found.map(|r| r.sequence), "temporal reading");
+    hand(out, found)
 }
 
 static NEXT_TOKEN: AtomicU64 = AtomicU64::new(1);
@@ -898,6 +908,7 @@ extern "system" fn find_by_id(this: This, id: *const [u8; 32], out: Out) -> HRES
 /// Lookup by object, platform handle or platform string: our devices have
 /// none of these.
 extern "system" fn find_device(_: This, _value: *const c_void, out: Out) -> HRESULT {
+    tracing::debug!("find device by object/handle/string asked");
     fail(out, DEVICE_NOT_FOUND)
 }
 extern "system" fn enable_oem_device(
@@ -909,7 +920,9 @@ extern "system" fn enable_oem_device(
 ) -> HRESULT {
     S_OK
 }
-extern "system" fn set_focus_policy(_: This, _policy: u32) {}
+extern "system" fn set_focus_policy(_: This, policy: u32) {
+    tracing::debug!(policy, "focus policy set");
+}
 
 static INPUT: Table<22> = Table([
     no_interface as *const (),        // 0x00
@@ -1016,23 +1029,35 @@ extern "system" fn reading_release(this: *const Reading) -> u32 {
     left
 }
 extern "system" fn input_kind(this: *const Reading) -> u32 {
-    reading(this).kind()
+    let kind = reading(this).kind();
+    tracing::debug!(kind = format_args!("{kind:#x}"), "reading kind asked");
+    kind
 }
 extern "system" fn sequence_number(this: *const Reading, kind: u32) -> u64 {
     let reading = reading(this);
-    if reading.kind() & kind != 0 {
+    let sequence = if reading.kind() & kind != 0 {
         reading.sequence
     } else {
         0
-    }
+    };
+    tracing::debug!(
+        kind = format_args!("{kind:#x}"),
+        reading_kind = format_args!("{:#x}", reading.kind()),
+        sequence,
+        "sequence asked"
+    );
+    sequence
 }
 extern "system" fn reading_timestamp(this: *const Reading) -> u64 {
     reading(this).timestamp
 }
 extern "system" fn reading_device(this: *const Reading, out: *mut *const Device) {
     if !out.is_null() {
+        let device = reading(this).device;
+        // SAFETY: one of our devices.
+        tracing::debug!(device = unsafe { &*device }.index, "reading device asked");
         // SAFETY: checked non-null; devices need no reference.
-        unsafe { out.write(reading(this).device) };
+        unsafe { out.write(device) };
     }
 }
 extern "system" fn key_count(this: *const Reading) -> u32 {
@@ -1049,6 +1074,7 @@ extern "system" fn key_state(this: *const Reading, count: u32, out: *mut KeyStat
         return 0;
     }
     let n = keys.len().min(count as usize);
+    tracing::debug!(n, "key state read");
     // SAFETY: the title passes room for `count` keys.
     unsafe { std::ptr::copy_nonoverlapping(keys.as_ptr(), out, n) };
     n as u32
@@ -1056,6 +1082,7 @@ extern "system" fn key_state(this: *const Reading, count: u32, out: *mut KeyStat
 extern "system" fn gamepad_state(this: *const Reading, out: *mut PadState) -> bool {
     match &reading(this).value {
         Value::Pad(state) if !out.is_null() => {
+            tracing::debug!(state = ?state, "gamepad state read");
             // SAFETY: checked non-null.
             unsafe { out.write(*state) };
             true
@@ -1064,9 +1091,34 @@ extern "system" fn gamepad_state(this: *const Reading, out: *mut PadState) -> bo
     }
 }
 /// Kinds our devices do not have: no count, no state.
+#[allow(dead_code)]
 extern "system" fn nothing(_: *const c_void) -> usize {
     0
 }
+/// Stubs that report which accessor slot the title actually calls.
+macro_rules! probe {
+    ($name:ident, $slot:literal) => {
+        extern "system" fn $name(_: *const c_void) -> usize {
+            tracing::debug!(slot = $slot, "unimplemented reading accessor called");
+            0
+        }
+    };
+}
+probe!(probe_raw, "0x38 raw report");
+probe!(probe_axis_count, "0x40 controller axis count");
+probe!(probe_axis_state, "0x48 controller axis state");
+probe!(probe_button_count, "0x50 controller button count");
+probe!(probe_button_state, "0x58 controller button state");
+probe!(probe_switch_count, "0x60 controller switch count");
+probe!(probe_switch_state, "0x68 controller switch state");
+probe!(probe_mouse, "0x80 mouse");
+probe!(probe_touch, "0x88 touch");
+probe!(probe_90, "0x90");
+probe!(probe_motion, "0x98 motion");
+probe!(probe_arcade, "0xa0 arcade stick");
+probe!(probe_flight, "0xa8 flight stick");
+probe!(probe_wheel, "0xb8 racing wheel");
+probe!(probe_uinav, "0xc0 ui navigation");
 
 static READING: Table<25> = Table([
     no_interface as *const (),      // 0x00
@@ -1076,24 +1128,24 @@ static READING: Table<25> = Table([
     sequence_number as *const (),   // 0x20
     reading_timestamp as *const (), // 0x28
     reading_device as *const (),    // 0x30
-    nothing as *const (),           // 0x38 raw report
-    nothing as *const (),           // 0x40 controller axes, buttons, switches
-    nothing as *const (),           // 0x48
-    nothing as *const (),           // 0x50
-    nothing as *const (),           // 0x58
-    nothing as *const (),           // 0x60
-    nothing as *const (),           // 0x68
+    probe_raw as *const (),         // 0x38 raw report
+    probe_axis_count as *const (),  // 0x40 controller axis count
+    probe_axis_state as *const (),  // 0x48 controller axis state
+    probe_button_count as *const (), // 0x50 controller button count
+    probe_button_state as *const (), // 0x58 controller button state
+    probe_switch_count as *const (), // 0x60 controller switch count
+    probe_switch_state as *const (), // 0x68 controller switch state
     key_count as *const (),         // 0x70
     key_state as *const (),         // 0x78
-    nothing as *const (),           // 0x80 mouse
-    nothing as *const (),           // 0x88 touch
-    nothing as *const (),           // 0x90
-    nothing as *const (),           // 0x98 motion
-    nothing as *const (),           // 0xa0 arcade stick
-    nothing as *const (),           // 0xa8 flight stick
+    probe_mouse as *const (),       // 0x80 mouse
+    probe_touch as *const (),       // 0x88 touch
+    probe_90 as *const (),          // 0x90
+    probe_motion as *const (),      // 0x98 motion
+    probe_arcade as *const (),      // 0xa0 arcade stick
+    probe_flight as *const (),      // 0xa8 flight stick
     gamepad_state as *const (),     // 0xb0
-    nothing as *const (),           // 0xb8 racing wheel
-    nothing as *const (),           // 0xc0 UI navigation
+    probe_wheel as *const (),       // 0xb8 racing wheel
+    probe_uinav as *const (),       // 0xc0 UI navigation
 ]);
 
 pub(crate) fn module() -> HleModule {
@@ -1175,6 +1227,10 @@ mod host {
         empty_until: [Option<Instant>; PADS],
         /// The cursor at the last `mouse()` ask, for its travel since.
         cursor: Option<(i32, i32)>,
+        /// Accumulated cursor travel decaying each ask: while the mouse
+        /// moves the stand-in stick stays turned; a delta read once would
+        /// fall back to zero before a 30 Hz reader ever saw it.
+        carry: (f32, f32),
     }
 
     impl Source for Host {
@@ -1219,6 +1275,9 @@ mod host {
                     // SAFETY: plain queries.
                     .filter(|&vk| unsafe { GetAsyncKeyState(i32::from(vk)) } < 0)
                     .collect();
+                if !held.is_empty() {
+                    tracing::debug!(held = ?held, "host keys held");
+                }
                 down.extend(held);
             }
             down.into_iter()
@@ -1236,6 +1295,7 @@ mod host {
         fn mouse(&mut self) -> MouseState {
             if !focused() {
                 self.cursor = None;
+                self.carry = (0.0, 0.0);
                 return MouseState::default();
             }
             let mut at = POINT::default();
@@ -1244,14 +1304,31 @@ mod host {
                 return MouseState::default();
             }
             let (x, y) = self.cursor.replace((at.x, at.y)).unwrap_or((at.x, at.y));
-            // About this much stick per pixel of travel between polls.
-            const GAIN: f32 = 0.06;
-            let down = |vk: i32| u8::from(unsafe { GetAsyncKeyState(vk) } < 0);
-            MouseState {
-                dx: (at.x - x) as f32 * GAIN,
-                dy: (y - at.y) as f32 * GAIN,
-                buttons: down(0x01) | down(0x02) << 1 | down(0x04) << 2,
+            // The travel adds to a carry that decays each poll: slow moves
+            // still clear the title's dead zone, quick flicks saturate, and
+            // a stopped mouse relaxes over ~200 ms instead of one poll.
+            const GAIN: f32 = 0.025;
+            const DECAY: f32 = 0.92;
+            self.carry.0 = self.carry.0 * DECAY + (at.x - x) as f32 * GAIN;
+            self.carry.1 = self.carry.1 * DECAY + (y - at.y) as f32 * GAIN;
+            // A decayed float never quite reaches zero; below this it is
+            // indistinguishable from rest anyway.
+            if self.carry.0.abs() < 0.005 {
+                self.carry.0 = 0.0;
             }
+            if self.carry.1.abs() < 0.005 {
+                self.carry.1 = 0.0;
+            }
+            let down = |vk: i32| u8::from(unsafe { GetAsyncKeyState(vk) } < 0);
+            let state = MouseState {
+                dx: self.carry.0.clamp(-1.0, 1.0),
+                dy: self.carry.1.clamp(-1.0, 1.0),
+                buttons: down(0x01) | down(0x02) << 1 | down(0x04) << 2,
+            };
+            if state.dx != 0.0 || state.dy != 0.0 || state.buttons != 0 {
+                tracing::debug!(state = ?state, "mouse polled");
+            }
+            state
         }
 
         fn rumble(&mut self, slot: usize, low: u16, high: u16) {
@@ -1307,10 +1384,15 @@ mod host {
     fn focused() -> bool {
         let mut process = 0;
         // SAFETY: plain queries; a null window gives process 0.
-        unsafe {
+        let focused = unsafe {
             GetWindowThreadProcessId(GetForegroundWindow(), &mut process);
             process == GetCurrentProcessId()
+        };
+        static WAS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+        if WAS.swap(focused, Ordering::Relaxed) != focused {
+            tracing::debug!(focused, process, "input focus changed");
         }
+        focused
     }
 
     #[test]
