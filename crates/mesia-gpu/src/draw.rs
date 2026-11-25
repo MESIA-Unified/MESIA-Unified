@@ -1305,10 +1305,23 @@ impl State {
         type Ranges = std::collections::HashMap<u32, (std::sync::Arc<crate::shadow::Shadow>, u64, u64)>;
         static RANGES: std::sync::Mutex<Option<std::collections::HashMap<usize, (u64, Ranges)>>> =
             std::sync::Mutex::new(None);
-        let mut kept = RANGES.lock().unwrap_or_else(|e| e.into_inner());
+        let mut guard = RANGES.lock().unwrap_or_else(|e| e.into_inner());
+        let kept = guard.get_or_insert_with(Default::default);
+        // The key is the heap's host object (a live COM pointer), not our
+        // `HostHeap`'s address: a heap released and made anew where the old
+        // one lay would otherwise inherit its ranges, keeping its copies
+        // alive and refreshing them against slots they no longer show.
+        // Past a few heaps the table only ever held dead heaps' entries:
+        // let them go, the copies with the care `retire` gives.
+        if kept.len() > 32 {
+            for (_, ranges) in std::mem::take(kept).into_values() {
+                for (shadow, _, _) in ranges.into_values() {
+                    crate::host::retire(shadow);
+                }
+            }
+        }
         let (passes, ranges) = kept
-            .get_or_insert_with(Default::default)
-            .entry(std::ptr::from_ref(host) as usize)
+            .entry(host.heap.as_raw() as usize)
             .or_insert_with(|| (0, Ranges::new()));
         // Every slot must still be re-inspected: a view of a released
         // resource goes stale without a write, and a slot written before
@@ -1372,7 +1385,7 @@ impl State {
             span.1 = span.1.min(*from);
             span.2 = span.2.max(*to);
         }
-        drop(kept);
+        drop(guard);
         let bytes: u64 = spans.values().map(|s| s.2 - s.1).sum();
         // Memory that is not write-watched is copied whole by every refresh.
         // It was once refreshed only every 120 frames (unmapped pages read
@@ -1384,19 +1397,25 @@ impl State {
         static WHOLE: std::sync::Mutex<Option<std::collections::HashMap<usize, u64>>> = std::sync::Mutex::new(None);
         let mut whole = WHOLE.lock().unwrap_or_else(|e| e.into_inner());
         let whole = whole.get_or_insert_with(Default::default);
+        // `MESIA_UNWATCHED_FRAMES` sets the interval (1: every frame).
+        static EVERY: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+        let every = *EVERY.get_or_init(|| {
+            std::env::var("MESIA_UNWATCHED_FRAMES")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(1)
+        });
+        // Copy numbers are counted up as copies are made: an entry outlives
+        // its copy. One older than the interval says only "refresh on
+        // sight", which no entry says too: shed them when the map grows.
+        if whole.len() > 4096 {
+            whole.retain(|_, last| frame < *last + every);
+        }
         for (shadow, from, to) in spans.values() {
             if shadow.unwatched() {
                 // By the copy's number: a copy made where one let go was
                 // (`shadow::let_go_idle`) has never been refreshed.
                 let key = shadow.id() as usize;
-                // `MESIA_UNWATCHED_FRAMES` sets the interval (1: every frame).
-                static EVERY: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-                let every = *EVERY.get_or_init(|| {
-                    std::env::var("MESIA_UNWATCHED_FRAMES")
-                        .ok()
-                        .and_then(|v| v.parse().ok())
-                        .unwrap_or(1)
-                });
                 match whole.get(&key) {
                     Some(&last) if frame < last + every => continue,
                     _ => {
@@ -2511,7 +2530,11 @@ fn host_signature(kind: u32, stride: u32) -> Option<ID3D12CommandSignature> {
         return None;
     }
     let signature = signature?;
-    made.push(((kind, stride), signature.clone()));
+    // `stride` is the title's: a title asking with ever-new strides must
+    // not grow the cache (and its linear search) for the run.
+    if made.len() < 64 {
+        made.push(((kind, stride), signature.clone()));
+    }
     Some(signature)
 }
 

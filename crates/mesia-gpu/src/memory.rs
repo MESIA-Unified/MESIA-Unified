@@ -50,6 +50,8 @@ use std::sync::{Arc, Mutex};
 use mesia_shader::emit::{MEMORY_FAULTS, MEMORY_PAGES};
 use windows::Win32::Graphics::Direct3D12::*;
 
+use windows::core::Interface;
+
 use crate::descriptor::host::HostHeap;
 use crate::host::{HostList, host};
 use crate::shadow::Shadow;
@@ -68,8 +70,8 @@ struct Memory {
     faults: (ID3D12Resource, *mut u32, u64),
     /// Copy `n` is `copies[n - 1]`.
     copies: Vec<Arc<Shadow>>,
-    /// Per host view heap (by address): the first slot of its run, and how
-    /// many copies have their view there.
+    /// Per host view heap (by its host object): the first slot of its run,
+    /// and how many copies have their view there.
     heaps: HashMap<usize, (u32, u32)>,
     /// The frame the faults were last read in.
     frame: u64,
@@ -275,7 +277,16 @@ pub(crate) fn ready(
             m.name(u64::from(c) << 8);
         }
     }
-    let key = std::ptr::from_ref(heap) as usize;
+    // The key is the heap's host object (a live COM pointer), not our
+    // `HostHeap`'s address: a heap released and made anew where the old one
+    // lay would otherwise be given the dead heap's run and write copies'
+    // views into slots a new run owns. Dead heaps' entries only ever held
+    // dead heaps' runs: past a few, the table is cleared and live heaps
+    // start fresh runs (an old run's slots stay held with its heap).
+    if m.heaps.len() >= 64 {
+        m.heaps.clear();
+    }
+    let key = heap.heap.as_raw() as usize;
     let (base, made) = match m.heaps.get(&key) {
         Some(&run) => run,
         None => {

@@ -272,8 +272,15 @@ fn decode(bytes: &[u8]) -> Option<HostShader> {
     let n = r.word()? as usize;
     let mut user_data = Vec::with_capacity(n.min(256));
     for _ in 0..n {
+        let index = r.word()?;
+        // `index` sizes the values `user_data_dwords` walks (`draw`): a
+        // corrupt entry must stay a miss. The root's user data is a few
+        // dwords; thousands can only be damage.
+        if index >= 4096 {
+            return None;
+        }
         user_data.push(UserData {
-            index: r.word()?,
+            index,
             slot: u8::try_from(r.word()?).ok()?,
             root: root_type(r.word()?),
             dword: r.word()?,
@@ -411,5 +418,18 @@ mod tests {
         assert_eq!(decode(&bytes[..bytes.len() - 1]), None);
         assert_eq!(decode(&[bytes.as_slice(), &[0]].concat()), None);
         assert_eq!(decode(b"VSH0"), None);
+    }
+
+    /// A user-data index that would wrap `user_data_dwords` (and then
+    /// index its values out of bounds in `draw`) is damage: a miss.
+    #[test]
+    fn a_damaged_user_data_index_is_rejected() {
+        let mut bad = shader();
+        bad.user_data[0].index = u32::MAX;
+        assert_eq!(decode(&encode(&bad)), None);
+        bad.user_data[0].index = 4096;
+        assert_eq!(decode(&encode(&bad)), None);
+        bad.user_data[0].index = 4095;
+        assert_eq!(decode(&encode(&bad)), Some(bad.clone()));
     }
 }

@@ -2681,8 +2681,13 @@ fn read_backs(list: &HostList) {
         unsafe {
             if buffer.Map(0, None, Some(&mut data)).is_ok() && !data.is_null() {
                 let from = data.cast::<u8>().cast_const();
+                // The kernel writes the destination: a page the title
+                // unmapped since the copy was recorded is left alone
+                // rather than faulted, and the range's guarded blocks are
+                // opened first so the writes do not trip the watch.
+                crate::watch::writing(*at, rows.saturating_mul(*pitch));
                 for line in 0..*rows {
-                    std::ptr::copy_nonoverlapping(from.add(line * row.next_multiple_of(256)), (*at as *mut u8).add(line * pitch), *row);
+                    crate::host::write_mapped((*at as *mut u8).add(line * pitch), from.add(line * row.next_multiple_of(256)), *row);
                 }
                 buffer.Unmap(0, None);
             }

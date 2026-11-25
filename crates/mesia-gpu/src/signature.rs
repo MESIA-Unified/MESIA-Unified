@@ -47,7 +47,9 @@ pub(crate) extern "system" fn create(
     let Some(desc) = (unsafe { desc.as_ref() }) else {
         return E_INVALIDARG;
     };
-    if desc.arguments.is_null() && desc.count > 0 {
+    // A record's arguments are a handful (each up to three fields): a
+    // count in the thousands can only be a bad description.
+    if desc.count > 4096 || (desc.arguments.is_null() && desc.count > 0) {
         return E_INVALIDARG;
     }
     let arguments = if desc.count == 0 {

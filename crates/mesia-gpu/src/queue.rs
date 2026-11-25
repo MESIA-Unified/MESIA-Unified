@@ -719,7 +719,18 @@ impl Written {
             }
             Written::SystemTimestamp => system_timestamp(),
         };
+        #[cfg(windows)]
+        {
+            let size = if bytes == 4 { 4 } else { 8 };
+            // The page the title named may have been unmapped since the
+            // write was recorded: write through the kernel, which leaves
+            // unmapped pages alone, and open the range's guarded blocks
+            // first so the write does not trip the watch.
+            crate::watch::writing(at as usize, size);
+            crate::host::write_mapped(at, value.to_le_bytes().as_ptr(), size);
+        }
         // SAFETY: the title names writable GPU memory (unified with ours).
+        #[cfg(not(windows))]
         unsafe {
             if bytes == 4 {
                 at.cast::<u32>().write_unaligned(value as u32);
