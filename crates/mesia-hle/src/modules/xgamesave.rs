@@ -510,14 +510,21 @@ fn read(c: &Container, names: Option<Vec<String>>) -> Result<Vec<(String, Vec<u8
         .map_err(|e| io_error(&c.dir, &e))?
         .ok_or(BLOB_NOT_FOUND)?;
     let names = names.unwrap_or_else(|| version.blobs.clone());
-    names
+    let out: Result<Vec<(String, Vec<u8>)>, HRESULT> = names
         .into_iter()
         .map(|name| {
             let i = version.blobs.iter().position(|b| *b == name).ok_or(BLOB_NOT_FOUND)?;
             let data = std::fs::read(version.blob(i)).map_err(|e| io_error(&c.dir, &e))?;
             Ok((name, data))
         })
-        .collect()
+        .collect();
+    tracing::debug!(
+        container = c.name,
+        on_disk = ?version.blobs,
+        read = ?out.as_ref().map(|b| b.iter().map(|(n, d)| (n.clone(), d.len())).collect::<Vec<_>>()),
+        "save read"
+    );
+    out
 }
 
 /// One blob as the public API lays it out: name, size, data.
@@ -592,10 +599,17 @@ fn report(root: &Path, keep: impl Fn(&str) -> bool, context: *mut c_void, callba
             })
             .collect()
     };
-    for (name, display, blob_count, total_size, last_modified) in &infos {
+    for (name, shown, blob_count, total_size, last_modified) in &infos {
+        tracing::debug!(
+            container = ?name.to_string_lossy(),
+            shown = ?shown.to_string_lossy(),
+            blob_count,
+            total_size,
+            "save container reported"
+        );
         let info = ContainerInfo {
             name: name.as_ptr(),
-            display_name: display.as_ptr(),
+            display_name: shown.as_ptr(),
             blob_count: *blob_count,
             total_size: *total_size,
             last_modified: *last_modified,
@@ -703,6 +717,7 @@ extern "system" fn enumerate_containers(
     let (Some(p), Some(callback)) = (get(provider), callback) else {
         return E_INVALIDARG;
     };
+    tracing::debug!(root = %p.root.display(), "enumerate save containers");
     report(&p.root, |_| true, context, callback);
     S_OK
 }
@@ -742,6 +757,7 @@ extern "system" fn enumerate_blobs(
         let version = current_named(&c.dir, &c.name).ok().flatten();
         version.map(|v| v.sizes()).unwrap_or_default()
     };
+    tracing::debug!(container = c.name, prefix, blobs = ?blobs, "enumerate blobs");
     for (name, size) in blobs.into_iter().filter(|(n, _)| n.starts_with(&prefix)) {
         let name = cstring(&name);
         let info = BlobInfo {

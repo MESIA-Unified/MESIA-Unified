@@ -3109,6 +3109,7 @@ impl Host {
             // live buffers, and the ranges lie in them.
             let recorded = unsafe {
                 (|| -> windows::core::Result<()> {
+                    tracing::debug!(site = "sync", alloc = ?allocator.as_raw(), "allocator reset");
                     allocator.Reset()?;
                     list.Reset(allocator, None)?;
                     for (shadow, ranges) in &dirty {
@@ -3231,6 +3232,7 @@ impl Host {
             // compare's own root signature.
             let recorded = unsafe {
                 (|| -> windows::core::Result<ID3D12CommandList> {
+                    tracing::debug!(site = "check", alloc = ?allocator.as_raw(), "allocator reset");
                     allocator.Reset()?;
                     list.Reset(allocator, None)?;
                     // What the submission's shaders wrote, first.
@@ -3516,6 +3518,7 @@ impl Host {
             // and the event are this thread's.
             let ran = unsafe {
                 (|| -> windows::core::Result<u64> {
+                    tracing::debug!(site = "relay-fetch", alloc = ?allocator.as_raw(), "allocator reset");
                     allocator.Reset()?;
                     list.Reset(&allocator, None)?;
                     for (shadow, lo, hi, at) in chunk {
@@ -3754,6 +3757,7 @@ impl Host {
             // fence and event are ours, under the submission lock.
             let ran = unsafe {
                 (|| -> windows::core::Result<()> {
+                    tracing::debug!(site = "cardback-fetch", alloc = ?allocator.as_raw(), "allocator reset");
                     allocator.Reset()?;
                     list.Reset(allocator, None)?;
                     for &(i, lo, hi, at) in &pieces {
@@ -4693,6 +4697,7 @@ impl HostList {
         }
         // SAFETY: the list is not executing.
         let reset = unsafe {
+            tracing::debug!(site = "hostlist", alloc = ?self.allocator.as_raw(), "allocator reset");
             self.allocator
                 .Reset()
                 .and_then(|()| self.list.Reset(&self.allocator, None))
@@ -5001,6 +5006,7 @@ impl HostList {
         // SAFETY: the prelude is not executing (every submission is waited
         // for); the textures are live.
         let recorded = unsafe {
+            tracing::debug!(site = "state-prelude", alloc = ?allocator.as_raw(), "allocator reset");
             allocator.Reset().and_then(|()| {
                 list.Reset(allocator, None)?;
                 if !to_copy.is_empty() {
