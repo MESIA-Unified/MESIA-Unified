@@ -12,6 +12,7 @@ blake3.workspace = true
 miniz_oxide.workspace = true
 tracing.workspace = true
 anyhow.workspace = true
+mesia-core.workspace = true
 mesia-formats.workspace = true
 mesia-pipeline.workspace = true
 mesia-shader.workspace = true

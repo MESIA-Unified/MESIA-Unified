@@ -12,7 +12,17 @@ use windows::Win32::Graphics::Dxgi::Common::*;
 pub(crate) fn folder() -> Option<&'static PathBuf> {
     static FOLDER: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();
     FOLDER
-        .get_or_init(|| std::env::var_os("MESIA_CAPTURE").map(PathBuf::from))
+        .get_or_init(|| {
+            std::env::var_os("MESIA_CAPTURE")
+                .map(PathBuf::from)
+                .filter(|dir| match mesia_core::ensure_outside_repo(dir) {
+                    Ok(()) => true,
+                    Err(e) => {
+                        tracing::warn!("policy: {e}");
+                        false
+                    }
+                })
+        })
         .as_ref()
 }
 

@@ -351,6 +351,7 @@ fn translate(
     // line holds one of the texts (a name, `#hash`), as the title has them.
     if let Ok(spec) = std::env::var("MESIA_DUMP_MATCH")
         && let Some((dir, texts)) = spec.split_once(';')
+        && dump_allowed(Path::new(dir))
     {
         let line = example();
         if texts.split('|').any(|text| !text.is_empty() && line.contains(text)) {
@@ -378,7 +379,8 @@ fn translate(
     };
     // `MESIA_FAIL_DUMP=<dir>`: the first 3 containers of each failure reason, as the title
     // has them (`.cdxil`), to work on a translator gap offline
-    let dump = std::env::var_os("MESIA_FAIL_DUMP");
+    let dump =
+        std::env::var_os("MESIA_FAIL_DUMP").filter(|d| dump_allowed(Path::new(d)));
     let before: Option<BTreeMap<String, usize>> = dump.as_ref().map(|_| t.failed.iter().map(|(k, v)| (k.clone(), v.0)).collect());
     translate_programs(&container, programs, &example, t, checks);
     if let (Some(dir), Some(before)) = (dump, before) {
@@ -492,6 +494,9 @@ fn census_line(label: &str, native: &NativeProgram, p: &ir::Program, shader: &em
     static OUT: std::sync::OnceLock<Option<Mutex<std::fs::File>>> = std::sync::OnceLock::new();
     let Some(out) = OUT.get_or_init(|| {
         let path = std::env::var_os("MESIA_SHADER_CENSUS")?;
+        if !dump_allowed(Path::new(&path)) {
+            return None;
+        }
         let file = std::fs::OpenOptions::new().create(true).append(true).open(path).ok()?;
         Some(Mutex::new(file))
     }) else {
@@ -540,6 +545,7 @@ fn check(
     // `MESIA_EMIT_DUMP` with `--list`: every emitted shader as a file.
     if t.list
         && let Ok(dir) = std::env::var("MESIA_EMIT_DUMP")
+        && dump_allowed(Path::new(&dir))
     {
         let name: String = label()
             .chars()
@@ -583,7 +589,9 @@ fn check(
                 .find(|l| l.contains("error"))
                 .unwrap_or(text.lines().next().unwrap_or(""))
                 .to_owned();
-            if let Ok(dir) = std::env::var("MESIA_EMIT_DUMP") {
+            if let Ok(dir) = std::env::var("MESIA_EMIT_DUMP")
+                && dump_allowed(Path::new(&dir))
+            {
                 let n = t
                     .failed
                     .get(&format!("validator: {first}"))
@@ -778,6 +786,21 @@ fn tally_structured(program: &ir::Program, s: &structure::Structured, t: &mut Ta
             }
         }
     }
+}
+
+/// Dumps named by env vars are still game data: outside the repo or not
+/// at all. One policy line per distinct directory.
+fn dump_allowed(dir: &Path) -> bool {
+    static SEEN: Mutex<BTreeMap<PathBuf, bool>> = Mutex::new(BTreeMap::new());
+    *lock(&SEEN).entry(dir.to_path_buf()).or_insert_with(|| {
+        match mesia_core::ensure_outside_repo(dir) {
+            Ok(()) => true,
+            Err(e) => {
+                eprintln!("POLICY VIOLATION: {e}");
+                false
+            }
+        }
+    })
 }
 
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
