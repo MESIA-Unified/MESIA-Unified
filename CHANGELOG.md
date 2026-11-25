@@ -3,12 +3,14 @@
 ## Unreleased
 
 ### Fixed
-- **>1M view-heap wrong textures** — on hosts capping view heaps at 1M
-  descriptors, indices in [737855, 999998] landed on dynamic slots and
-  read other draws' descriptors. A capped heap now keeps a dedicated
-  null slot between mirrored and dynamic ranges; out-of-range views
-  read defined zeros. Sampler heaps >2048 cap to a real heap; past-heap
-  writes counted (`PAST_HEAP`), warned per 64K band.
+- **>1M view-heap** — first attempt (dedicated null slot, `f59ee56`)
+  made out-of-range views defined-null: correct but invisible, and the
+  table covers enough real views that it showed as a mass black screen.
+  REVERTED (`25a95f1`) — indices land on dynamic slots again (wrong but
+  visible). True fix stays: second host heap + index-range select.
+- **Black screen / silent run** — resolved live: the null-slot clamp,
+  not the compile storm. Display + in-game audio confirmed restored by
+  the user.
 - **Permanent unmirrored heap** — `Heap::host()` cached `None` on a
   transient `HostHeap::new` failure; now built before publishing.
 - **Pipeline create-path waste** — thundering herd (every `make` woke
