@@ -81,7 +81,7 @@ shader pair now renders verified pixels.
   persists both guest containers so offline replay re-runs the identical
   translation.
 - Command-layer design study (audit only — nothing enforced yet): the
-  U-16 indirect-execution taint specification recovered from upstream, a
+  U-16 indirect-execution taint specification recovered from the technical audit, a
   guest-command IR sketch, state-invalidation policies, and a hang/TDR
   risk register that became the Milestone 6 plan.
 - Built by four parallel lab agents in isolated worktrees against a
@@ -107,7 +107,7 @@ translator internals.
 
 - Translation service exposing neutral owned types only
   (`translate(guest_container_bytes) -> TranslatedShader`), running over a
-  `victory-shader` derivative, so alternative translators could implement
+  the lab's shader-translation codepath, so alternative translators could implement
   the same contract. Exactly one translation path exists in the engine.
 - Fixture writer that produces **real guest containers** — synthetic
   fixtures take the same code path a title's bytes would. Fixtures are
@@ -167,7 +167,7 @@ readback-verified render.
   each driver compile costs roughly a gigabyte of memory on the test
   machine) designed from the audit findings.
 - External design input: a technical audit of the open-source
-  ScarlettPort project informed several mechanisms — the descriptor guard
+  the audited project informed several mechanisms — the descriptor guard
   slot, the skipped-work/indirect-call taint rule, PSO build lanes, the
   journal→offline-build model, and VRAM-proportional budgets. Concepts
   were re-implemented; no code was copied.
@@ -195,14 +195,14 @@ Mapped images execute, and the engine gets its single D3D12 device owner.
 - GPU device layer: the single `ID3D12Device` owner (high-performance
   adapter preference with fallback), a direct queue, fence epochs, and
   submit/wait.
-- Deferred-retire lane generalizing prior art to explicit epochs —
+- Deferred-retire lane generalizing prior-art practice to explicit epochs —
   nothing is freed while the GPU may still use it — plus device-removed
   detection that maps a `u64::MAX` fence failure to a
   `GetDeviceRemovedReason`-backed error and has waiters re-sample after
   waking.
 - Fence-guarded memory pool adapter: budget + LRU eviction, but only
   among allocations whose last submitted use has completed; pinned
-  exclusion; clean `BudgetExhausted` denial when every candidate is in
+  ethe reference engineusion; clean `BudgetExhausted` denial when every candidate is in
   flight.
 
 ### Verified
@@ -220,12 +220,12 @@ representation, one mapper, one binding contract.
 ### Added
 
 - Shared `PreparedImage` intermediate representation: one prepare pipeline
-  (victory's `prepare()` — its strength is loadconfig/CFG/CHPE patching)
-  feeds one lab-written manual mapper in xcl's style (allocation, section
+  (one reference engine's `prepare()` — its strength is loadconfig/CFG/CHPE patching)
+  feeds one lab-written manual mapper in the field's manual-mapper style (allocation, section
   copy, relocations, import table, TLS, protections), with import binding
   routed through pluggable resolver and missing-import policy traits so
-  either upstream engine's HLE tables can drive it.
-- Cross-engine PE-facts harness: both upstream parsers diffed
+  either reference engine's HLE tables can drive it.
+- Cross-engine PE-facts harness: both reference parsers diffed
   field-by-field over a 49-image synthetic corpus, plus a byte-parity
   methodology — snapshots are normalized (un-rebased) so two mappings of
   the same file are comparable regardless of ASLR, and everything outside
@@ -237,14 +237,14 @@ representation, one mapper, one binding contract.
 - Unified configuration: paths plus per-subsystem backend selection.
 - Documented divergences found by the parity harness, including a
   normalization bug in our own test code (caught by the harness — exactly
-  its purpose) and the discovery that xcl binds several kernel32 imports
+  its purpose) and the discovery that one reference engine binds several kernel32 imports
   to its own instrumentation shims — now modeled as a policy choice
   rather than a discrepancy.
 
 ### Verified
 
 - **10/10 workspace tests, 0 warnings** — parser agreement across the
-  corpus, byte-parity of the unified mapper against both upstream
+  corpus, byte-parity of the unified mapper against independent
   reference pipelines on the same image, a plain host-DLL mapping sanity
   test, and the arena contract tests. All synthetic fixtures; no title
   content.

@@ -16,7 +16,7 @@ an RTX 3060 / Windows 11). All verified behavior is exercised through
         │   mesia-loader    │ │   mesia-shader    │ │  mesia-command    │
         │ PreparedImage IR  │ │ translate() →     │ │ decode → IR →     │
         │ + manual mapper   │ │ TranslatedShader  │ │ Recording → guard │
-        │ + ImportResolver  │ │ (victory-shader   │ │ → execute_into()  │
+        │ + ImportResolver  │ │ (translator core  │ │ → execute_into()  │
         │ + LoadedImage     │ │  derivative;      │ │ (IndirectGuard =  │
         │   lifecycle       │ │  neutral types)   │ │  U-16 rule)       │
         └─────────┬─────────┘ └─────────┬─────────┘ └─────────┬─────────┘
@@ -118,7 +118,7 @@ Semantics, strictly:
 
 - Taint is per-recording (`taint_any`), cleared only by `reset()`; a
   mid-recording split inherits it. One skip poisons the whole recording — the
-  strictest recovered upstream semantics — because a rewrite cannot prove it
+  strictest audited semantics — because a rewrite cannot prove it
   repaired every bound output.
 - `lost_writes` tracks precisely which buffers a skipped producer was bound to
   write (a future per-buffer mode exists on paper); `written` is bookkeeping
@@ -140,7 +140,7 @@ guest DXBC container (console-precompiled GFX10 machine code)
    graphics adds: ISG1 / OSG1 / PSG1 signature parts + per-stage
    stage_data (semantics tables, SPI_PS_INPUT_ADDR, DB_SHADER_CONTROL,
    8-MRT export-patch table)
-        │  mesia-shader::translate          ← victory-shader derivative
+        │  mesia-shader::translate          ← the lab's shader-translation codepath
         ▼
 TranslatedShader { stage, dxil, user_data[], user_data_dwords,
                    samplers, static_samplers, root_cbvs/srvs/uavs,
@@ -182,9 +182,9 @@ Two design rules worth stating plainly:
 
 | Rule | Origin | Enforcement |
 |---|---|---|
-| Never free while the GPU may still use it | both upstream engines | Fence-epoch deferred retire; `last_use <= completed` required to free or evict |
-| An unwritten descriptor must never fault the GPU | upstream audit — out-of-range descriptor reads hang | Permanent null guard slot + null-fill at heap creation |
-| A skipped producer's indirect args are poison | upstream crash 0x887a0006 (the U-16 rule) | `IndirectGuard` neutralization, GPU-verified |
+| Never free while the GPU may still use it | both reference engines | Fence-epoch deferred retire; `last_use <= completed` required to free or evict |
+| An unwritten descriptor must never fault the GPU | technical audit of published work — out-of-range descriptor reads hang | Permanent null guard slot + null-fill at heap creation |
+| A skipped producer's indirect args are poison | documented crash 0x887a0006 (the U-16 rule) | `IndirectGuard` neutralization, GPU-verified |
 | Root signature and PSO bind as one indivisible pair | structural TDR vector | Emitted lazily together at first pipeline-dependent command |
 | Driver sees only bytes we serialized | `ID3D12PipelineLibrary` `DEVICE_REMOVED` incident | Hash-verified `MESIAPSO` envelope; per-PSO `CachedPSO` instead of a library object |
 | PSO builds are bounded | driver compile ≈ 1 GB each; 16 GB machine | ≤4 build threads, urgent/gfx/compute lanes, bounded wait + stall counter |

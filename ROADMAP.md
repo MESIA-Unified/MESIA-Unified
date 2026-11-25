@@ -14,21 +14,21 @@ Current state: **6 integration phases complete · 100 automated tests green,
 
 ### Phase 0 — Workspace foundation ✅
 
-- One Cargo workspace where both upstream engine trees coexist as path
+- One Cargo workspace where independent engine trees coexist as path
   dependencies, a unified config layer (`mesia-core`), and a cross-engine PE
   harness (`PeFacts` contract, per-field diff report).
 - Both PE parsers proven to agree on every fact over a 49-image corpus.
 
 ### Phase 1 — Unified PE loader (`mesia-loader`) ✅
 
-- Single `PreparedImage` IR produced by victory's `prepare()` pipeline
+- Single `PreparedImage` IR produced by one reference engine's `prepare()` pipeline
   (loadconfig/CFG/CHPE patching), mapped/bound by one lab-written manual mapper
-  (xcl-style: VirtualAlloc + section copy + relocs + IAT + TLS +
+  (a manual-mapper style: VirtualAlloc + section copy + relocs + IAT + TLS +
   VirtualProtect).
 - Pluggable `ImportResolver` / `MissingImportPolicy` traits so HLE tables from
   either engine can drive binding.
 - **Byte-parity proven both ways**: normalized snapshots of the same title
-  mapped by victory, xcl, and the unified mapper differ only inside a computed
+  mapped by the reference engine, the reference engine, and the unified mapper differ only inside a computed
   "allowed set" (loadconfig patch fields, ImageBase, security cookie, TLS index,
   missing-import stubs). Every exported probe callable through both pipelines;
   TLS callbacks ran.
@@ -44,7 +44,7 @@ Current state: **6 integration phases complete · 100 automated tests green,
   queue, fence epochs, `submit`/`wait`, registry ledger — and device-removed
   *detection* (`u64::MAX` → `GetDeviceRemovedReason`).
 - `mesia-mem::gpupool::FencePool`: budget + LRU eviction arbitrated by the
-  fence (`last_use <= completed` required to free anything), pinned exclusion,
+  fence (`last_use <= completed` required to free anything), pinned ethe reference engineusion,
   deferred-free bytes committed until the epoch passes.
 - Hardware-verified: UPLOAD→DEFAULT→READBACK copy byte-exact; deferred retire
   follows the fence on the live queue. 21/21 tests green.
@@ -71,7 +71,7 @@ Current state: **6 integration phases complete · 100 automated tests green,
 ### Phase 4 — Shader translation service (`mesia-shader`) ✅
 
 - One translation path: `translate(guest_container_bytes) -> TranslatedShader`
-  over a `victory-shader` derivative; **neutral owned types only** — `mesia-gpu`
+  over a the lab's shader-translation codepath; **neutral owned types only** — `mesia-gpu`
   binds the result without seeing translator internals.
 - `guest_container` writes *real* guest DXBC containers (DXIL/XDAT/XBCH-zlib/
   FSSM) so fixtures take the same code path a title's bytes would.
@@ -100,7 +100,7 @@ Current state: **6 integration phases complete · 100 automated tests green,
   **2016/4096 green texels**, byte-exact inside/outside colors; repeat draws
   byte-identical with the PSO built once.
 - Command-layer design audit delivered: `GuestCommand` IR + deferred-compile
-  contract, U-16 indirect-taint spec fully recovered from upstream, 12-entry
+  contract, U-16 indirect-taint spec fully recovered from the technical audit, 12-entry
   hang/TDR risk register.
 - 64/64 tests green.
 
@@ -114,7 +114,7 @@ Current state: **6 integration phases complete · 100 automated tests green,
   decoded `Dispatch` → translated compute, readback-exact; compute-produced
   `(3,1,0,0)` args → `ExecuteIndirect` draws it (U-16 happy path); a `Broken`
   producer → same call neutralized, zero texels written (U-16 protection).
-- Guard semantics: strictest upstream parity — one skipped producer poisons the
+- Guard semantics: strictest audited parity — one skipped producer poisons the
   recording until `reset()`; neutralization emits
   `ExecuteIndirect(sig, 0, args, 0, NULL, 0)`; cap `MESIA_INDIRECT_MAX=65536`.
 - **100/100 tests green, 0 warnings.**
@@ -145,12 +145,12 @@ Current state: **6 integration phases complete · 100 automated tests green,
 | **Wave64 breadth** | One compute program is verified on GPU; divergent-ballot and lane-mask patterns untested through our harness | phase 4 base |
 | **Command coverage** — indexed draws, scissor op in the IR, count-buffer `ExecuteIndirect` on GPU (parsed + emitted, untested), multi-RT, wider state objects | `MESC` exercises today's IR only | phase 6 base |
 | **Real guest command formats** | Lab stream → real record formats; requires a legal-content strategy first | exploring item above + the standing constraint that no legal title content exists on the lab machine |
-| **Texture/resource streaming** | Titles stream constantly; write-tracking costs are a known upstream trap (~600 ms/frame before caching) | resource model maturity |
+| **Texture/resource streaming** | Titles stream constantly; write-tracking costs are a known known trap (~600 ms/frame before caching) | resource model maturity |
 | **Swapchain / present path** | Everything renders offscreen today, verified by readback | render path stability |
 | **Device-removed recovery** | Detection-only today; now testable on demand | exploring item above |
-| **HLE import policy** — optional xcl-style kernel32 interception behind a policy flag | Designed since phase 1 (`ImportResolver` seam), not wired | loader consumers |
+| **HLE import policy** — optional a manual-mapper style kernel32 interception behind a policy flag | Designed since phase 1 (`ImportResolver` seam), not wired | loader consumers |
 | **License strategy for source publication** | The lab combines GPL-2.0-only and GPL-3.0-or-later components; publication is blocked until the license review resolves a compliant path | legal, not technical |
-| **Engine options surface** — `VICTORY_F16_NEAREST` (console-exact f16 rounding), PSO thread budgets, guard modes as real config | Currently env/once flags | config plumbing |
+| **Engine options surface** — `a console-exact f16 rounding flag` (console-exact f16 rounding), PSO thread budgets, guard modes as real config | Currently env/once flags | config plumbing |
 
 ## Explicitly out of scope
 

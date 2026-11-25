@@ -51,7 +51,7 @@ Six crates, un moteur — détails dans
 | `mesia-mem` | Arènes mémoire hôte, `FencePool` — résidency budgétée + LRU arbitrée par les époques de fence GPU |
 | `mesia-core` | Configuration unifiée, harnais de comparaison PE `PeFacts` inter-moteurs |
 | `mesia-gpu` | L'unique backend D3D12 : device/queue/époques de fence, `GpuAllocator` (`Evict`/`MakeResident` réels), heaps de descripteurs avec slot de garde nul, `PipelineLibrary` dédupliquée avec cache persistant `D3D12_CACHED_PIPELINE_STATE` + journal hors-ligne |
-| `mesia-shader` | Traducteur GFX10→DXIL (construit sur un dérivé de `victory-shader`), analyse des conteneurs invité (DXBC/DXIL/XDAT/XBCH/FSSM + signatures `ISG1`/`OSG1`), abaissement wave64→largeur hôte, types de sortie neutres `TranslatedShader` |
+| `mesia-shader` | Traducteur GFX10→DXIL, analyse des conteneurs invité (DXBC/DXIL/XDAT/XBCH/FSSM + signatures `ISG1`/`OSG1`), abaissement wave64→largeur hôte, types de sortie neutres `TranslatedShader` |
 | `mesia-command` | Couche de commandes invité : décodeur du flux laboratoire `MESC` → IR typée `GuestCommand` → `Recording` + `IndirectGuard` → exécuteur émettant sur les surfaces D3D12 partagées |
 
 ## Où en est le projet
@@ -93,25 +93,10 @@ modèle, tests GPU sérialisés par l'orchestrateur. Les contrats d'interface so
 conservés comme artefacts du laboratoire — une méthodologie notable pour quiconque
 coordonne du travail parallèle sur un moteur Rust fortement couplé.
 
-## Veille amont
-
-MESIA Unified s'appuie sur des travaux publics antérieurs et en suit les
-corrections :
-
-- [`xcl-dev/xcl`](https://github.com/xcl-dev/xcl)
-- [`fxceless/victory-fork`](https://github.com/fxceless/victory-fork)
-- [`ZigZagBoi1/ScarlettPort`](https://github.com/ZigZagBoi1/ScarlettPort)
-- [`DeIete13/MESIA`](https://github.com/DeIete13/MESIA)
-
-Les enseignements d'ingénierie tirés de ces codebases (époques de libération
-différée, slots de garde descripteurs, marquage des appels indirects, budgets de
-compilation PSO, abaissement wave64) sont cités dans les documents
-d'architecture et d'état.
-
 ## Statut du code source
 
 Le code source du moteur reste **privé** dans l'attente d'une analyse de
-compatibilité des licences des composants amont qu'il consomme — résumons :
+compatibilité des licences des composants tiers qu'il consomme — résumons :
 « analyse de licence en cours » ; le laboratoire ne distribuera ni builds ni code
 tant qu'elle n'est pas résolue. Ce dépôt publie entre-temps la documentation,
 les rapports d'état et la feuille de route du projet sous

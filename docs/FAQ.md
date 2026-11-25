@@ -12,7 +12,7 @@ synthetic fixtures inside the private lab.
 
 ## Can it run any game at all?
 
-**No.** The engine is verified exclusively on **synthetic fixtures** — lab-built
+**No.** The engine is verified ethe reference engineusively on **synthetic fixtures** — lab-built
 PE binaries, hand-assembled GFX10 shader programs, and lab-format command
 streams. There is no legal title content on the development machine, no game
 has ever been loaded by this engine, and no game compatibility exists to
@@ -22,7 +22,7 @@ report.
 
 **Private, pending license review.** The engine source lives in a closed lab
 repository. Publication is blocked by an unresolved license-compatibility
-question across the upstream components the engine consumes — call it
+question across the third-party components the engine consumes — call it
 **"license review in progress"**; we won't distribute code or builds until it
 is resolved. This public repository ships **documentation only** (status,
 architecture, roadmap, reports) under CC-BY-4.0.
@@ -85,14 +85,14 @@ compatibility systems, performance measurement, testing, and documentation.
 
 The published material is **documentation under CC-BY-4.0**, describing
 clean-room engineering on synthetic fixtures — no proprietary content is
-reproduced. The engine consumes upstream open-source components; the
+reproduced. The engine consumes third-party open-source components; the
 publication of its source awaits the license-compatibility resolution noted
 above. Nothing here is a tool for infringing anyone's rights: no game files,
 no circumvention, no redistribution.
 
 ## Why is it called "Unified"?
 
-Because it merges what three separate upstream codebases do — PE loading and
+Because it merges what three separate independent codebases do — PE loading and
 HLE binding, GPU command submission, and GFX10 shader translation — into one
 engine with one device, one memory policy, one translation path, and one test
 gate. The "unified" refers to the architecture, not to any product claim.

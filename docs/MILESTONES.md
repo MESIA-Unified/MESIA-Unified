@@ -20,18 +20,18 @@ are cumulative workspace totals for the whole private lab at that phase.
 
 ## Milestone 1 — Unified loader and the memory contract
 
-**Goal.** Merge the two upstream engines' loading paths into a single
+**Goal.** Merge the two reference engines' loading paths into a single
 intermediate representation and prove — at the byte level — that the merged
 loader produces images equivalent to both reference pipelines.
 
 **What shipped.**
 
-- A shared `PreparedImage` IR: one prepare pipeline — victory's
+- A shared `PreparedImage` IR: one prepare pipeline — the reference engine's
   `prepare()`, whose strength is loadconfig/CFG/CHPE patching — feeds one
-  lab-written manual mapper in xcl's style (allocation, section copy,
+  lab-written manual mapper in a manual-mapper style (allocation, section copy,
   relocations, import table, TLS, memory protections).
 - Pluggable `ImportResolver` / `MissingImportPolicy` traits, so either
-  upstream engine's HLE tables can drive import binding as a policy
+  reference engine's HLE tables can drive import binding as a policy
   choice.
 - A cross-engine PE harness: both parsers report a common `PeFacts`
   contract, diffed field-by-field over a 49-image synthetic corpus.
@@ -45,11 +45,10 @@ loader produces images equivalent to both reference pipelines.
 
 **How it was verified (10/10 tests, 0 warnings).**
 
-- `pe_compare` (3 tests): both upstream parsers agree on every fact across
+- `pe_compare` (3 tests): both reference parsers agree on every fact across
   the 49-image corpus.
-- `victory_and_unified_produce_working_images_of_the_same_title` and
-  `xcl_and_unified_map_the_same_title_to_identical_bytes`: the unified
-  mapper's output compared byte-for-byte against both upstream reference
+- Two reference-loader parity tests (`*_and_unified_*`): the unified
+  mapper's output compared byte-for-byte against independent reference
   mappings of the same image — normalized bytes identical outside the
   documented allowed set, exported probe functions returning identical
   values through both pipelines, TLS callbacks and `DllMain` attach/detach
@@ -61,7 +60,7 @@ loader produces images equivalent to both reference pipelines.
 
 The harness already paid for itself: it caught a normalization bug in our
 own test code (bound import slots must be skipped when un-relocating) and
-isolated a real behavioral difference — xcl binds several kernel32 imports
+isolated a real behavioral difference — one reference engine binds several kernel32 imports
 to its own instrumentation shims rather than raw host pointers — which is
 now modeled as a policy flag rather than a bug.
 
@@ -99,7 +98,7 @@ D3D12 device owner with a fence-guarded memory model.
   waking.
 - `FencePool`: the memory-pool adapter where budget + LRU eviction is
   epoch-guarded — a page is only evictable if its last submitted use has
-  completed. Pinned allocations are excluded; denial is a clean
+  completed. Pinned allocations are ethe reference engineuded; denial is a clean
   `BudgetExhausted`.
 
 **How it was verified (21/21 tests, 0 warnings).**
@@ -108,7 +107,7 @@ D3D12 device owner with a fence-guarded memory model.
   on a spawned thread (entry → exit 0 → result through bound imports),
   bind census.
 - `gpupool` (3 tests, deterministic mock clock): deferred frees wait for
-  the fence; in-flight allocations are never evicted; pinned exclusion.
+  the fence; in-flight allocations are never evicted; pinned ethe reference engineusion.
 - `gpu_device` (5 tests, on hardware): single device/queue, submit + fence
   wait, an **UPLOAD→DEFAULT→READBACK copy verified byte-exact**, registry
   tracking, deferred retire following the fence.
@@ -151,7 +150,7 @@ verified pixels.
   removal. The per-PSO cached-blob mechanism achieves the same effect
   through a safe surface.
 
-Design input came from a technical audit of the open-source ScarlettPort
+Design input came from a technical audit of the open-source prior art
 project — the descriptor guard slot, the skipped-work/indirect-call taint
 rule, PSO build lanes, the journal→offline-build model, and
 VRAM-proportional budgets were adopted as concepts and re-implemented; no
@@ -190,7 +189,7 @@ verified end-to-end on hardware.
 **What shipped.**
 
 - `mesia-shader`: a single `translate(guest_container_bytes) ->
-  TranslatedShader` path over a `victory-shader` derivative, exposing
+  TranslatedShader` path over a the lab's shader-translation codepath, exposing
   neutral owned types only — the GPU layer binds results without seeing
   translator internals, so alternative translators could implement the
   same contract.
@@ -263,7 +262,7 @@ triangle from translated guest shaders.
   compile layering; the journal records both guest containers and
   render-target formats for identical offline replay.
 - A command-layer design audit (read-only): the U-16 indirect-execution
-  taint specification fully recovered from upstream, a guest-command IR
+  taint specification fully recovered from the technical audit, a guest-command IR
   and deferred-compile contract, state-invalidation policies, a sync
   model, and a hang/TDR risk register — this became the Milestone 6 plan.
 

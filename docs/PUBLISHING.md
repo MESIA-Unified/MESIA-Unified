@@ -80,7 +80,7 @@ redactions:
 - **No private file paths.** Reference public docs paths only.
 - **No vendored-component internals or code excerpts.** Mechanism names,
   format names, and design contracts are fine (the public docs already say
-  "xcl-style interception", "a `victory-shader` derivative", "descriptor
+  "a manual-mapper style interception", "the lab's shader-translation codepath", "descriptor
   guard slot"); implementation internals of third-party code are not.
 - **Lab bookkeeping stays lab-side.** Already-public identifiers (e.g.
   the U-16 rule name used across these docs) may be referenced; raw

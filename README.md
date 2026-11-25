@@ -12,7 +12,7 @@ hardware — as a single, unified engine.
 
 > **This repository ships documentation only.** The engine source is developed in
 > a private lab and is not yet published — a license-compatibility review across
-> its upstream components is in progress. See the [FAQ](docs/FAQ.md) and the
+> its third-party components is in progress. See the [FAQ](docs/FAQ.md) and the
 > [source status](#source-status) section below.
 
 **Français :** voir [README_FR.md](README_FR.md).
@@ -46,7 +46,7 @@ Six crates, one engine — details in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.m
 | `mesia-mem` | Host memory arenas, `FencePool` — budget + LRU residency arbitrated by GPU fence epochs |
 | `mesia-core` | Unified configuration, cross-engine `PeFacts` PE-comparison harness |
 | `mesia-gpu` | The single D3D12 backend: device/queue/fence epochs, `GpuAllocator` (real `Evict`/`MakeResident`), descriptor heaps with a null guard slot, dedup'd `PipelineLibrary` with a persistent `D3D12_CACHED_PIPELINE_STATE` cache + offline journal |
-| `mesia-shader` | GFX10→DXIL translator (built on a `victory-shader` derivative), guest container parsing (DXBC/DXIL/XDAT/XBCH/FSSM + `ISG1`/`OSG1` signature parts), wave64→host-width lowering, neutral `TranslatedShader` output types |
+| `mesia-shader` | GFX10→DXIL translator, guest container parsing (DXBC/DXIL/XDAT/XBCH/FSSM + `ISG1`/`OSG1` signature parts), wave64→host-width lowering, neutral `TranslatedShader` output types |
 | `mesia-command` | Guest command layer: `MESC` lab stream decoder → typed `GuestCommand` IR → `Recording` + `IndirectGuard` → executor emitting onto the shared D3D12 surfaces |
 
 ## Where it stands
@@ -56,9 +56,9 @@ Six integration phases completed in the private lab, **100 automated tests green
 Full milestone text in [ROADMAP.md](ROADMAP.md) and
 [docs/DEVELOPMENT_STATUS.md](docs/DEVELOPMENT_STATUS.md). Highlights:
 
-- **PE loader** — one unified image pipeline proven byte-parity against both
-  upstream engines' loaders; TLS callbacks and `DllMain`/EXE entry points run
-  end-to-end on lab fixtures.
+- **PE loader** — one unified image pipeline proven byte-parity against
+  independent reference loaders; TLS callbacks and `DllMain`/EXE entry
+  points run end-to-end on lab fixtures.
 - **D3D12 backend** — single device on an RTX 3060, fence-epoch deferred frees,
   real `Evict`/`MakeResident` residency under a hard budget, descriptor heaps
   hardened with a permanent null guard slot + null-fill.
@@ -85,26 +85,13 @@ interface contracts are treated as lab artifacts (they survive in the reports)
 — a methodology worth noting for anyone coordinating parallel work on a tightly
 coupled Rust engine.
 
-## Upstream watch
-
-MESIA Unified stands on prior public work and tracks it for fixes:
-
-- [`xcl-dev/xcl`](https://github.com/xcl-dev/xcl)
-- [`fxceless/victory-fork`](https://github.com/fxceless/victory-fork)
-- [`ZigZagBoi1/ScarlettPort`](https://github.com/ZigZagBoi1/ScarlettPort)
-- [`DeIete13/MESIA`](https://github.com/DeIete13/MESIA)
-
-Engineering lessons from these codebases (deferred-free epochs, descriptor guard
-slots, indirect-call tainting, PSO build budgets, wave64 lowering) are cited in
-the architecture and status documents.
-
 ## Source status
 
 The engine source remains **private** pending a license-compatibility review
-across the upstream components it consumes — call it "license review in
-progress"; the lab will not distribute builds or code until it is resolved. This
-repository publishes the project's documentation, status reports, and roadmap
-under [CC-BY-4.0](LICENSE) in the meantime.
+across the third-party components it consumes — call it "license review in
+progress"; the lab will not distribute builds or code until it is resolved.
+This repository publishes the project's documentation, status reports, and
+roadmap under [CC-BY-4.0](LICENSE) in the meantime.
 
 ## Join the MESIA Unified Development Team
 
