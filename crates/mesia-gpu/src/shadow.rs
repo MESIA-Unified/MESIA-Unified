@@ -3485,6 +3485,337 @@ mod window_tests {
     }
 }
 
+#[cfg(test)]
+mod refresh_tests {
+    use super::{PAGE, Shadow};
+    use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_12_0;
+    use windows::Win32::Graphics::Direct3D12::*;
+    use windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC;
+    use windows::Win32::Graphics::Dxgi::*;
+    use windows::core::Interface;
+    use windows_sys::Win32::System::Memory as mem;
+
+    /// The host's write watching (not in windows-sys' memory module).
+    const MEM_WRITE_WATCH: u32 = 0x20_0000;
+
+    /// The device on the software adapter, as `inplace`'s `warp()`: `None`
+    /// where there is none, and the test ends there.
+    fn warp() -> Option<ID3D12Device> {
+        // SAFETY: plain DXGI queries and device creation on the software
+        // adapter; a card is never opened.
+        unsafe {
+            let factory: IDXGIFactory4 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).ok()?;
+            let adapter: IDXGIAdapter = factory.EnumWarpAdapter().ok()?;
+            let desc = adapter.cast::<IDXGIAdapter1>().ok()?.GetDesc1().ok()?;
+            if desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 == 0 {
+                return None;
+            }
+            let mut device: Option<ID3D12Device> = None;
+            D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device).ok()?;
+            device
+        }
+    }
+
+    /// A buffer as `Host::shared_buffer` makes it: in the PC's memory
+    /// (L0), write-back so the CPU side of a copy reads fast, and shaders
+    /// may write it; mapped for the CPU's side.
+    fn shared(device: &ID3D12Device, size: u64) -> Option<(ID3D12Resource, *mut u8)> {
+        let heap = D3D12_HEAP_PROPERTIES {
+            Type: D3D12_HEAP_TYPE_CUSTOM,
+            CPUPageProperty: D3D12_CPU_PAGE_PROPERTY_WRITE_BACK,
+            MemoryPoolPreference: D3D12_MEMORY_POOL_L0,
+            ..Default::default()
+        };
+        let desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+            Width: size.max(4),
+            Height: 1,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+            Flags: D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+            ..Default::default()
+        };
+        let mut buffer: Option<ID3D12Resource> = None;
+        let mut data = std::ptr::null_mut();
+        // SAFETY: plain buffer creation and persistent CPU mapping.
+        unsafe {
+            device
+                .CreateCommittedResource(
+                    &heap,
+                    D3D12_HEAP_FLAG_NONE,
+                    &desc,
+                    D3D12_RESOURCE_STATE_COMMON,
+                    None,
+                    &mut buffer,
+                )
+                .ok()?;
+            let buffer = buffer?;
+            buffer.Map(0, None, Some(&mut data)).ok()?;
+            Some((buffer, data.cast()))
+        }
+    }
+
+    /// Committed read-write memory as `xmem` gives the title, write-watched
+    /// when `watched` (the fix watches fixed-base reservations too); freed
+    /// on drop. The `usize` is its length.
+    struct Watched(*mut u8, usize);
+    impl Watched {
+        fn new(bytes: usize, watched: bool) -> Option<Watched> {
+            Self::at(std::ptr::null_mut(), bytes, watched)
+        }
+        fn at(base: *mut u8, bytes: usize, watched: bool) -> Option<Watched> {
+            let kind =
+                mem::MEM_RESERVE | mem::MEM_COMMIT | if watched { MEM_WRITE_WATCH } else { 0 };
+            // SAFETY: a fresh allocation, freed in `drop`.
+            let p = unsafe { mem::VirtualAlloc(base.cast(), bytes, kind, mem::PAGE_READWRITE) };
+            (!p.is_null()).then_some(Watched(p.cast(), bytes))
+        }
+        /// Writes `seed`'s pattern into page `page`, as a frame's title
+        /// writes would.
+        fn fill(&self, page: usize, seed: u8) {
+            // SAFETY: `page` is inside the committed allocation.
+            unsafe {
+                for i in 0..PAGE {
+                    self.0
+                        .add(page * PAGE + i)
+                        .write((i as u8).wrapping_mul(31).wrapping_add(seed));
+                }
+            }
+        }
+        /// The page `fill` writes of `seed`.
+        fn pattern(seed: u8) -> Vec<u8> {
+            (0..PAGE)
+                .map(|i| (i as u8).wrapping_mul(31).wrapping_add(seed))
+                .collect()
+        }
+        /// Frees the allocation and makes another at its base, as the
+        /// title's own reuse of an address does. What the old one showed
+        /// stays in the copy's marks and in the journal: a private free is
+        /// not reported to the GPU side. False if the base was not had
+        /// back.
+        fn remap(&mut self, watched: bool) -> bool {
+            let (base, bytes) = (self.0, self.1);
+            // SAFETY: our allocation.
+            unsafe { mem::VirtualFree(base.cast(), 0, mem::MEM_RELEASE) };
+            let kind =
+                mem::MEM_RESERVE | mem::MEM_COMMIT | if watched { MEM_WRITE_WATCH } else { 0 };
+            // SAFETY: a fresh allocation at the base just freed, which a
+            // field at a time replaces: dropping a `Watched` frees it, so
+            // none may hold the freed base again.
+            let p = unsafe { mem::VirtualAlloc(base.cast(), bytes, kind, mem::PAGE_READWRITE) };
+            self.0 = p.cast();
+            !p.is_null()
+        }
+    }
+    impl Drop for Watched {
+        fn drop(&mut self) {
+            // SAFETY: our allocation.
+            unsafe { mem::VirtualFree(self.0.cast(), 0, mem::MEM_RELEASE) };
+        }
+    }
+
+    /// A host copy of `title`'s memory, as `lookup` makes one for a title
+    /// buffer; the copy's mapping is returned beside it. Its refreshes are
+    /// the submission's own ([`Shadow::update`]).
+    fn copy_of(device: &ID3D12Device, title: &Watched) -> Option<(Shadow, *mut u8)> {
+        let (buffer, data) = shared(device, title.1 as u64)?;
+        // SAFETY: a live buffer.
+        let gpu = unsafe { buffer.GetGPUVirtualAddress() };
+        Some((
+            Shadow::new(buffer, data, gpu, title.0 as u64, title.1 as u64),
+            data,
+        ))
+    }
+
+    /// Page `page` of the copy's mapping.
+    fn mirror<'a>(data: *mut u8, page: usize) -> &'a [u8] {
+        // SAFETY: the mapping holds the copy's length of bytes.
+        unsafe { std::slice::from_raw_parts(data.add(page * PAGE), PAGE) }
+    }
+
+    /// A title write is in the copy at the next refresh: pages written get
+    /// their newest bytes, pages not written keep theirs, a page written
+    /// twice carries the second write — never last frame's. On the
+    /// software adapter; ends early where one cannot be made.
+    #[test]
+    fn refreshes_carry_the_newest_writes_not_last_frames() {
+        let Some(device) = warp() else { return };
+        const PAGES: usize = 6;
+        let Some(title) = Watched::new(PAGES * PAGE, true) else {
+            return;
+        };
+        let Some((shadow, data)) = copy_of(&device, &title) else {
+            return;
+        };
+        let (start, len) = (title.0 as usize, title.1);
+        // Never copied: the first refresh takes everything.
+        for page in 0..PAGES {
+            title.fill(page, 0x10);
+        }
+        assert_eq!(shadow.update(start, len), len, "first copy is whole");
+        assert!(
+            !shadow.unwatched(),
+            "watched memory must not be marked unwatched"
+        );
+        for page in 0..PAGES {
+            assert_eq!(
+                mirror(data, page),
+                Watched::pattern(0x10).as_slice(),
+                "frame 1 page {page}"
+            );
+        }
+        // A frame that writes two pages: only they move, the rest keep
+        // their bytes (not a whole copy, and nothing from before them).
+        title.fill(1, 0x20);
+        title.fill(3, 0x30);
+        assert_eq!(
+            shadow.update(start, len),
+            2 * PAGE,
+            "only the written pages are carried"
+        );
+        for (page, seed) in [
+            (0, 0x10),
+            (1, 0x20),
+            (2, 0x10),
+            (3, 0x30),
+            (4, 0x10),
+            (5, 0x10),
+        ] {
+            assert_eq!(
+                mirror(data, page),
+                Watched::pattern(seed).as_slice(),
+                "frame 2 page {page}"
+            );
+        }
+        // A page written again the next frame carries the second write.
+        title.fill(3, 0x40);
+        title.fill(5, 0x50);
+        assert_eq!(shadow.update(start, len), 2 * PAGE);
+        for (page, seed) in [
+            (0, 0x10),
+            (1, 0x20),
+            (2, 0x10),
+            (3, 0x40),
+            (4, 0x10),
+            (5, 0x50),
+        ] {
+            assert_eq!(
+                mirror(data, page),
+                Watched::pattern(seed).as_slice(),
+                "frame 3 page {page}"
+            );
+        }
+        // A frame that writes nothing refreshes nothing and loses nothing.
+        assert_eq!(
+            shadow.update(start, len),
+            0,
+            "nothing written, nothing copied"
+        );
+        for (page, seed) in [
+            (0, 0x10),
+            (1, 0x20),
+            (2, 0x10),
+            (3, 0x40),
+            (4, 0x10),
+            (5, 0x50),
+        ] {
+            assert_eq!(
+                mirror(data, page),
+                Watched::pattern(seed).as_slice(),
+                "frame 4 page {page}"
+            );
+        }
+    }
+
+    /// A reservation freed and made again at its base — the title's own
+    /// reuse of a fixed address, watched again as `xmem` now makes it —
+    /// reports what it shows now: the new content is carried, not the old
+    /// reservation's, and the refresh does not fault.
+    #[test]
+    fn a_remapped_reservation_reports_its_new_content() {
+        let Some(device) = warp() else { return };
+        const PAGES: usize = 4;
+        let Some(mut title) = Watched::new(PAGES * PAGE, true) else {
+            return;
+        };
+        let Some((shadow, data)) = copy_of(&device, &title) else {
+            return;
+        };
+        let (start, len) = (title.0 as usize, title.1);
+        for page in 0..PAGES {
+            title.fill(page, 0x10);
+        }
+        assert_eq!(shadow.update(start, len), len);
+        assert!(title.remap(true), "the freed base was not had back");
+        // New content in every page: all of it is reported and carried.
+        for page in 0..PAGES {
+            title.fill(page, 0x70 + page as u8);
+        }
+        assert_eq!(
+            shadow.update(start, len),
+            len,
+            "the new reservation's writes"
+        );
+        assert!(!shadow.unwatched(), "the new reservation is watched too");
+        for page in 0..PAGES {
+            assert_eq!(
+                mirror(data, page),
+                Watched::pattern(0x70 + page as u8).as_slice(),
+                "remapped page {page}"
+            );
+        }
+        // Remade and written in one page only: that page is carried; the
+        // others keep the bytes they had. The journal's write records and
+        // the copy's marks outlive the old reservation, so a page the
+        // title never writes into the new one is not seen as written:
+        // there the copy goes on showing what the old reservation showed.
+        assert!(title.remap(true), "the freed base was not had back");
+        title.fill(2, 0x90);
+        assert_eq!(
+            shadow.update(start, len),
+            PAGE,
+            "only the page written anew"
+        );
+        assert_eq!(mirror(data, 2), Watched::pattern(0x90).as_slice());
+        for page in [0, 1, 3] {
+            assert_eq!(
+                mirror(data, page),
+                Watched::pattern(0x70 + page as u8).as_slice(),
+                "page {page} never written in the new reservation"
+            );
+        }
+    }
+
+    /// Memory the watch refused — committed, read-write, not watched and
+    /// no view — is marked unwatched and copied whole at every refresh:
+    /// the other half of the fix (`MESIA_UNWATCHED_FRAMES` at 1) keeps such
+    /// copies at the title's newest bytes too, at the price of the range.
+    #[test]
+    fn an_unwatched_copy_is_copied_whole_at_every_refresh() {
+        let Some(device) = warp() else { return };
+        const PAGES: usize = 2;
+        let Some(title) = Watched::new(PAGES * PAGE, false) else {
+            return;
+        };
+        let Some((shadow, data)) = copy_of(&device, &title) else {
+            return;
+        };
+        let (start, len) = (title.0 as usize, title.1);
+        title.fill(0, 0x10);
+        assert_eq!(shadow.update(start, len), len);
+        assert!(shadow.unwatched(), "plain memory must turn out unwatched");
+        title.fill(1, 0x20);
+        assert_eq!(shadow.update(start, len), len, "the whole range every time");
+        assert_eq!(mirror(data, 0), Watched::pattern(0x10).as_slice());
+        assert_eq!(mirror(data, 1), Watched::pattern(0x20).as_slice());
+    }
+}
+
 /// For device-removed reports: the copy of title memory whose host range
 /// starts closest below host GPU address `va`, and where `va` is in it.
 pub(crate) fn near(va: u64) -> String {
