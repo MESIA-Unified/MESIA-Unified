@@ -2023,7 +2023,9 @@ impl State {
                 .push((std::ptr::from_ref(heap) as usize, first, n));
             // The title's own slots of this table: what the draw reads of
             // them it brings up to date here, in the dynamic slots.
-            let title_first = heap.index(table).filter(|first| first + n <= host.count());
+            let title_first = heap
+                .index(table)
+                .filter(|first| first.checked_add(n).is_some_and(|end| end <= host.count()));
             // The whole range: a shader may index past the entries its
             // used-resource list names (descriptor arrays).
             for k in 0..n {

@@ -85,18 +85,21 @@ impl Heap {
             return None;
         }
         let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
-        // A recorder can take the fast path as soon as the OnceLock is
-        // initialized. Publish only after replaying the queued writes.
-        self.host
-            .get_or_init(|| {
-                let step = u64::from(increment(self.desc.kind)?);
-                let h = host::HostHeap::new(self.samplers(), self.desc.count)?;
-                for i in pending.drain(..) {
-                    h.mirror(i, self.start + u64::from(i) * step, false);
-                }
-                Some(h)
-            })
-            .as_ref()
+        // A loser of the first-use race sees the heap already published.
+        if let Some(h) = self.host.get() {
+            return h.as_ref();
+        }
+        // Build outside the OnceLock: it caches whatever the closure
+        // returns, so a failed try (a transient allocation failure on the
+        // >100 MB commit) used to pin this heap at None forever - never
+        // mirrored again. Publish only after replaying the queued writes;
+        // a recorder can take the fast path as soon as it is initialized.
+        let step = u64::from(increment(self.desc.kind)?);
+        let h = host::HostHeap::new(self.samplers(), self.desc.count)?;
+        for i in pending.drain(..) {
+            h.mirror(i, self.start + u64::from(i) * step, false);
+        }
+        self.host.get_or_init(|| Some(h)).as_ref()
     }
 
     /// The handle of descriptor `index` of this heap.
