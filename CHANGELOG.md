@@ -3,6 +3,17 @@
 ## Unreleased
 
 ### Fixed
+- **`synth_scene` WARP crash** — root cause was a use-after-free: the
+  RTV descriptor heap was dropped at the end of `Scene::new` while the
+  stored `rtv_a`/`rtv_b` handles pointed into it and were recorded into
+  every command list. Now kept alive in `Scene`; the WARP skip is
+  removed, both frames bit-identical on hardware and WARP.
+- **Heap-buffer sweep spikes** — the full 83k-slot rescan ran every 16
+  passes (0.4–1.9 s inside one frame); now a rotating 1/16 slice per
+  pass, same staleness guarantee, ~1/16 of the cost per frame.
+- **GPU test contention** — `diff_tests` ran real compute work without
+  the `ONE_AT_A_TIME` lock every other GPU test holds; plausible source
+  of the observed TDR under parallel load. Serialized.
 - **Translate/device parity** — `emit::host::Host::new` now queries
   `D3D12_FEATURE_D3D12_OPTIONS1` like the game does: `translate
   --pipelines` reproduces production exactly (wave64-stuck refusals are
@@ -56,8 +67,15 @@
   library save runs only once the make queue drains (no mid-storm
   serialize stalls).
 - `tests/synth_scene.rs` — native D3D12 reference renderer with golden
-  images and an inter-frame freshness check (bit-identical frame 1 on
-  RTX 3060 and WARP; WARP second-frame crash is an open issue).
+  images and an inter-frame freshness check (bit-identical on RTX 3060
+  and WARP, both frames).
+- `tests/compute_correctness.rs` — six original-HLSL checks with exact
+  CPU references on hardware and WARP: groupshared barrier reductions,
+  wave intrinsics, divergent-branch writes, 256-SRV descriptor table,
+  null-descriptor reads, compute→pixel interop.
+- `tests/heavy_load.rs` — reproducible heavy synthetic load (thousands
+  of draws, multi-pass, timestamp queries) printing p50/p95/p99, CPU vs
+  GPU ms, RAM/VRAM; gated behind `MESIA_HEAVY=1`.
 - `pool_tests`, `merge_groups` equivalence tests (336 sets).
 - Test: fixed-base reservation write-watch tracking (xmem).
 - Docs: `test-inventory.md`, `memory-coherency.md`, `d3d12-validation.md`,
@@ -67,11 +85,10 @@
 
 ### Known issues
 - `written_pages_are_reported_to_every_asker` — fixed (was journal staleness, not flaky)
-- GPU TDR under parallel test load (`v_cvt_norm` once) — transient, retried
 - >1M view-heap: wrong/black textures in heavy scenes
 - `E_INVALIDARG` on wave64-stuck compute pipelines — root cause confirmed:
   cross-half-wave code (LDS shared across a >32 thread group, lane masks
   crossing lane 32, `v_mbcnt`) needs lowering machinery that does not exist
   yet; `MESIA_WAVE_WIDE=1` recovers some, at documented GPU-hang risk
-- WARP faults inside its software rasterizer on synth_scene frame 2
+
 - GPL-2.0-only/GPL-3.0 module conflict (see THIRD_PARTY_NOTICES.md)
