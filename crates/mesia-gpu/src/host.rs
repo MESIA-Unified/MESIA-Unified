@@ -4015,6 +4015,42 @@ impl Host {
         number
     }
 
+    /// Asks the fence itself whether the card passed `target`, when the
+    /// event could not be armed on it (a `Signal` or
+    /// `SetEventOnCompletion` failure): for up to five seconds — far
+    /// past any real submission — the wait the event would have done,
+    /// counted the same ([`working`], [`stood`]). `true` once the fence
+    /// says the card passed. `false` with the device already removed:
+    /// nothing was waited for, and the caller's removal check ends the
+    /// run where the wait's end does. A fence not there by then is a
+    /// hung card — the run ends as a removal's does ([`fail`]), before
+    /// anything that depends on the wait (copy-backs, `FINISHED`,
+    /// landing) is done.
+    fn fence_reached(&self, target: u64, waiting: std::time::Instant) -> bool {
+        tracing::error!(
+            "no event could be set on the card's fence (value {target}): the fence itself is asked, for up to five seconds"
+        );
+        // SAFETY: a plain query; a removed device never reaches `target`.
+        if unsafe { self.device.GetDeviceRemovedReason() }.is_err() {
+            return false;
+        }
+        working(false);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        // SAFETY: a plain query, asked until the card passed `target` or
+        // the deadline gave it up for hung.
+        while unsafe { self.fence.GetCompletedValue() } < target {
+            if std::time::Instant::now() >= deadline {
+                fail(format_args!(
+                    "the card never passed fence value {target} with no wait that could be set on it: the card hangs"
+                ));
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        stood(waiting);
+        working(true);
+        true
+    }
+
     /// Waits for the card to run every flight in the air ([`late`]) and
     /// does what they left to do, as [`Host::execute`] does for one
     /// submission after its wait: the pieces their shaders wrote in copies
@@ -4075,7 +4111,15 @@ impl Host {
                             stood(waiting);
                             working(true);
                         }
-                        Err(e) => tracing::warn!(error = %e, "submissions sent ahead not waited for"),
+                        Err(e) => {
+                            tracing::warn!(error = %e, "submissions sent ahead not waited for");
+                            // The fence itself is asked instead; nothing
+                            // that depends on the wait runs until it says
+                            // the card passed. A removed device is named
+                            // by the check below, where the wait's end
+                            // names it.
+                            self.fence_reached(*submitted, waiting);
+                        }
                     }
                 }
                 let gpu = waiting.elapsed();
@@ -4355,6 +4399,9 @@ impl Host {
         #[cfg(not(feature = "diagnostics"))]
         let groups = [&lists[..]];
         submitting(2, runs.len());
+        // Whether a wait confirmed the card ran every group sent:
+        // `FINISHED` is stored for that alone.
+        let mut confirmed = true;
         for (i, group) in groups.iter().enumerate() {
             *submitted += 1;
             let started = std::time::Instant::now();
@@ -4373,7 +4420,19 @@ impl Host {
                         stood(started);
                         working(true);
                     }
-                    Err(e) => tracing::warn!(error = %e, "host submission not waited for"),
+                    Err(e) => {
+                        tracing::warn!(error = %e, "host submission not waited for");
+                        // The fence itself is asked instead — a `Signal`
+                        // that failed may have signalled all the same; a
+                        // `SetEventOnCompletion` failure leaves the
+                        // signal behind it. A device gone is ended below
+                        // as the wait's end ends it, before this
+                        // submission counts as finished.
+                        if !self.fence_reached(*submitted, started) {
+                            confirmed = false;
+                            break;
+                        }
+                    }
                 }
             }
             // With timing on each group is one of `runs` (and the compare
@@ -4403,8 +4462,13 @@ impl Host {
             let _ = (i, started);
         }
         let _ = &firsts;
-        FINISHED.store(this_submission, Ordering::Release);
-        bury(this_submission);
+        // Only a submission the card was confirmed to have run counts as
+        // finished: with the device gone (no wait could be made for it),
+        // the removal check below ends the run instead.
+        if confirmed {
+            FINISHED.store(this_submission, Ordering::Release);
+            bury(this_submission);
+        }
         let gpu = prepared.elapsed();
         SUBMISSION_US[0].fetch_add((prepared - started).as_micros() as u64, Ordering::Relaxed);
         SUBMISSION_US[1].fetch_add(gpu.as_micros() as u64, Ordering::Relaxed);
