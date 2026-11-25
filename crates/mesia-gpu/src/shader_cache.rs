@@ -56,6 +56,11 @@ fn build() -> &'static [u8; 32] {
                 bytes.extend_from_slice(&limit.to_le_bytes());
                 // Which group barriers wait is part of the translation too.
                 bytes.push(mesia_shader::emit::group_sync());
+                // And the host's widest wave: translations lowered for
+                // waves of 32 are no good on a 64-lane card, and a
+                // WaveSize(64) translation cached on one is refused on
+                // this one.
+                bytes.extend_from_slice(&mesia_shader::emit::host_max_wave().to_le_bytes());
                 // So are the switches that pick the form of a wave64 program:
                 // without them here a run with `MESIA_WAVE_WIDE=0` was
                 // served the translations an earlier run of the same
@@ -64,6 +69,7 @@ fn build() -> &'static [u8; 32] {
                     "MESIA_WAVE_WIDE",
                     "MESIA_WAVE_DEEP_SKIPS",
                     "MESIA_WAVE_OWN_BITS",
+                    "MESIA_WAVE_LOCAL",
                     "MESIA_F16_NEAREST",
                 ] {
                     bytes.extend_from_slice(name.as_bytes());
