@@ -1224,15 +1224,14 @@ pub(crate) fn relay_merge_all(
     work: &[(Arc<Shadow>, usize, usize)],
     found: Vec<Vec<(usize, usize)>>,
 ) -> Vec<usize> {
+    // `work`'s `from`/`to` are title addresses already (as `find_all`
+    // and `relay_merge`'s `inside` take them): the title bytes an item's
+    // merges may write are inside `[from, to)` — never shifted by
+    // `shadow.start`. Two copies covering the same title bytes (a window
+    // over a buffer, a buffer in a buffer) land in one job this way.
     let spans: Vec<(usize, usize, usize)> = work
         .iter()
-        .map(|(shadow, from, to)| {
-            (
-                Arc::as_ptr(shadow) as usize,
-                shadow.start as usize + from,
-                shadow.start as usize + to,
-            )
-        })
+        .map(|(shadow, from, to)| (Arc::as_ptr(shadow) as usize, *from, *to))
         .collect();
     let groups = merge_groups(&spans);
     let shared = Arc::new((work.iter().map(|(s, f, t)| (s.clone(), *f, *t)).collect::<Vec<_>>(), found));
