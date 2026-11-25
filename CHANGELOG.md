@@ -3,6 +3,31 @@
 ## Unreleased
 
 ### Fixed
+- **>1M view-heap wrong textures** — on hosts capping view heaps at 1M
+  descriptors, indices in [737855, 999998] landed on dynamic slots and
+  read other draws' descriptors. A capped heap now keeps a dedicated
+  null slot between mirrored and dynamic ranges; out-of-range views
+  read defined zeros. Sampler heaps >2048 cap to a real heap; past-heap
+  writes counted (`PAST_HEAP`), warned per 64K band.
+- **Permanent unmirrored heap** — `Heap::host()` cached `None` on a
+  transient `HostHeap::new` failure; now built before publishing.
+- **Pipeline create-path waste** — thundering herd (every `make` woke
+  all waiters → per-Pending condvar), `describe()` re-formatted 3× per
+  pipeline (OnceLock), QUADS/TRIANGLE dedupe miss, root signatures
+  recreated per pipeline (now shared), re-hashed key inside the
+  PENDINGS lock, per-pipeline container re-parse (memoized).
+- **Sleep precision** — `std::thread::sleep` truncates to whole ms;
+  frame waits now use a high-resolution waitable timer (overshoot −43%
+  on 4 ms waits).
+- **Copy-back scratch waste** — fresh zeroed 64 KiB per call → pooled
+  grow-only; per-piece clear+resize → grow-only; unmapped merge is a
+  plain copy (equivalence-tested).
+- **Land-time AVs** — `Written::write`/`read_backs` wrote title memory
+  at land time; unmapped pages now skipped via `watch::writing` +
+  `write_mapped`. Corrupt `UserData.index` in the shader cache could
+  panic a draw. Stale-address-keyed tables (`RANGES`, `m.heaps`) now
+  keyed by live COM pointer; three unbounded title-controlled
+  collections capped.
 - **`synth_scene` WARP crash** — root cause was a use-after-free: the
   RTV descriptor heap was dropped at the end of `Scene::new` while the
   stored `rtv_a`/`rtv_b` handles pointed into it and were recorded into
@@ -75,7 +100,11 @@
   null-descriptor reads, compute→pixel interop.
 - `tests/heavy_load.rs` — reproducible heavy synthetic load (thousands
   of draws, multi-pass, timestamp queries) printing p50/p95/p99, CPU vs
-  GPU ms, RAM/VRAM; gated behind `MESIA_HEAVY=1`.
+  GPU ms, RAM/VRAM; gated behind `MESIA_HEAVY=1`. Sustained run: 1500
+  frames / ~5 min, p50 192 ms GPU, RAM flat at 96 MiB, hash stable.
+- `tests/compute_advanced.rs` — second-wave checks: groupshared bank
+  patterns, UAV atomics, lane exchange, mask bitcount, UAV RAW hazards,
+  bitwise determinism, f16/unorm edges (7/7 HW+WARP).
 - `pool_tests`, `merge_groups` equivalence tests (336 sets).
 - Test: fixed-base reservation write-watch tracking (xmem).
 - Docs: `test-inventory.md`, `memory-coherency.md`, `d3d12-validation.md`,
@@ -85,7 +114,10 @@
 
 ### Known issues
 - `written_pages_are_reported_to_every_asker` — fixed (was journal staleness, not flaky)
-- >1M view-heap: wrong/black textures in heavy scenes
+- >1M view-heap: out-of-range views now read null (defined), not wrong;
+  true fix = second host heap + index-range select (P1 backlog)
+- Cross-process GPU contention (heavy_load + test suite at once) can
+  TDR a long dispatch — run GPU tests while the GPU is free
 - `E_INVALIDARG` on wave64-stuck compute pipelines — root cause confirmed:
   cross-half-wave code (LDS shared across a >32 thread group, lane masks
   crossing lane 32, `v_mbcnt`) needs lowering machinery that does not exist
