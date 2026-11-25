@@ -826,6 +826,21 @@ extern "system" fn present(
         }
     }
     #[cfg(windows)]
+    {
+        // A second plane (a video overlay, say) or a plane of several
+        // resources is dropped below: log the loss so black cinematics
+        // can be told apart from missing pipelines.
+        if planes > 1 {
+            tracing::info!(frame, planes, "present carries more than one plane; only the first is shown");
+        } else if planes == 1 && !plane_parameters.is_null() {
+            // SAFETY: the title passes `planes` plane descriptions.
+            let first = unsafe { plane_parameters.read() };
+            if first.count != 1 {
+                tracing::info!(frame, count = first.count, "present plane holds more than one resource; only the first is shown");
+            }
+        }
+    }
+    #[cfg(windows)]
     if planes > 0
         // SAFETY: the title passes `planes` plane descriptions.
         && let Some(plane) = unsafe { plane_parameters.as_ref() }
