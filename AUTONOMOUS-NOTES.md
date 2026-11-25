@@ -115,7 +115,24 @@ Plan : baseline reproductible (Phase 1) → CPU (watch incrémental, relay_wait,
 - 127 tests mesia-gpu verts.
 
 ### À faire ensuite
-- **Fixer le bug flights** (cause profonde : gating descripteur 176b425 incomplet ? vie ressources en vol ?) — c'est le gros gain restant : flights ramenaient ~700 ms vs 600 sync ET le présent parallèle. Repro fiable : n'importe quel LATE_WAIT≥1, in-world, crash <2 min.
+- ~~**Fixer le bug flights**~~ → fait : `016dddb` (voir § V5 vague 1 ci-dessous).
 - Mesurer le gain réel des commits A+B en synchrone propre (baseline 837 → ~600 ms observé, mais scènes différentes — refaire une mesure même scène).
 - Candidats GPU agent C : barrières superflues shaders traduits (UAV fence global par s_barrier — 50-150 ms estimés), hash-on-CPU pendant upload, batch compares, coalescing ranges upload.
-- Caveat `no_copies` : écrits shader→mémoire titre jamais rapatriés — OK perf, pas correct pour gameplay (animation/visibilité GPU→CPU figées). Durable : copy-back « cheap but correct » (items C 2-6).
+- Caveat `no_copies` : écrits shader→mémoire titre jamais rapatriés — OK perf, pas correct pour gameplay (animation/visibilité GPU→CPU figées). Durable : copy-back « cheap but correct » (items C 2-6) OU `MESIA_INPLACE=2` (écrits directs en mémoire titre — voir ci-dessous).
+
+## 2026-11-25 — campagne V5, vague 1
+
+### Bug flights — cause racine identifiée et fix commité (`016dddb`)
+- Agent read-only : la mutation **non gatée** = `memory::ready` (memory.rs) qui écrit des descripteurs UAV 32 octets dans le run partagé heap-lifetime (`raw_uav_at`) pendant qu'un flight est en vol → shader en vol lit un descripteur déchiré → VA sauvage → DEVICE_HUNG. Trou dans le gating 176b425 (couvre mirror/mirror_shown, pas raw_uav_at).
+- Fix : `host::settle_and_hold()` — settle les flights en vol **puis garde le lock `submitted`** pendant l'écriture des slots manquants (aucun nouveau flight ne peut partir entre settle et writes). Reste du code inchangé ; directory dwords atomiques et slots null = bénins.
+- Secondaire (non fixé, data-level) : `strides` écrit même quand le descripteur est deferred ; `Step::Host` skipped by blocked_by ; `Staging.submission` under-stamp ; ordering directory-avant-slot (lectures null bénignes).
+
+### Mémoire (audit agent D1) — top consommateurs
+- Windows host copies 4 MiB : **2,7-4,3 Go**, ~50 % gâchis de grille → `MESIA_WINDOW_KB=1024` ajouté à play.ps1.
+- `MESIA_INPLACE` : stage 1 (windows) déjà actif ; **stage 2 (title buffers) interdit sous late_wait** (ranges déclarés inconnus pour buffers placés) — play.ps1 reste à 1 tant que LATE_WAIT≥1.
+- Autres : snapshot POOL 512 MB const, `fetched` jamais réduit, `kept` épingle toute ressource vue, `COPIES=1023` conservés toute la run.
+
+### En cours au moment du handoff
+- Test `LATE_WAIT=2` + `INPLACE=1` + `-Fast` sur le nouveau binaire : flights actifs en menu (« 3.0 sent ahead/frame »), 0 crash — **mais bloqué au sélecteur de profil** : l'injection `drive.ps1 key Enter` ne passe plus (focus Windows refusé). L'utilisateur doit appuyer Enter/A une fois ; ensuite surveiller le monde (<2 min = ancien temps de crash).
+- Si le monde tient >5 min sous LATE_WAIT=2 → monter à LATE_WAIT=3 puis RELAY=2 ; si le monde crash → dumper le nouveau breadcrumb et ré-analyser (résidu possible : écritures post-settle).
+- Mesurer frame-time + RAM sous INPLACE=1 ; si flights prouvés stables, `INPLACE=2` reste interdit (incompatible late_wait).
