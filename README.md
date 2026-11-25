@@ -121,7 +121,7 @@ for contributors with experience — or serious interest — in:
 
 To apply, read [CONTRIBUTING.md](CONTRIBUTING.md) and open an issue using the
 **collaborator application** template (`.github/ISSUE_TEMPLATE/`), or start from
-the [issue tracker](https://github.com/MESIA-Project/MESIA-Unified/issues).
+the [issue tracker](https://github.com/MESIA-Unified/MESIA-Unified/issues).
 
 ## Documentation
 

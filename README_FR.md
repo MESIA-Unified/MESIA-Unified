@@ -135,7 +135,7 @@ dans :
 
 Pour postuler, lisez [CONTRIBUTING.md](CONTRIBUTING.md) et ouvrez un ticket avec
 le modèle **collaborator application** (`.github/ISSUE_TEMPLATE/`), ou partez du
-[gestionnaire de tickets](https://github.com/MESIA-Project/MESIA-Unified/issues).
+[gestionnaire de tickets](https://github.com/MESIA-Unified/MESIA-Unified/issues).
 
 ## Documentation
 

@@ -29,7 +29,7 @@ Please report all of the above **privately** through GitHub:
 3. Describe what you found, where, and why it is a concern.
 
 If private vulnerability reporting is not available, contact the project
-owner (@MESIA-Project) directly through GitHub.
+owner (@MESIA-Unified) directly through GitHub.
 
 **Do not open a public issue** for suspected sensitive material or license
 problems — public discussion spreads the very content that would need to be

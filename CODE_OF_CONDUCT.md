@@ -60,7 +60,7 @@ representative at an online or offline event.
 
 Instances of abusive, harassing, or otherwise unacceptable behavior may be
 reported to the community leaders responsible for enforcement by contacting the
-project owner (@MESIA-Project) through GitHub — via the owner's GitHub profile
+project owner (@MESIA-Unified) through GitHub — via the owner's GitHub profile
 or the private reporting channels described in SECURITY.md.
 
 All complaints will be reviewed and investigated promptly and fairly.
