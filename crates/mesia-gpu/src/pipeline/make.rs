@@ -16,7 +16,7 @@
 //! runs only once and whose pipeline takes longer is lost.
 
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -29,6 +29,14 @@ pub(crate) struct Pending {
     pub(crate) graphics: Option<Box<GraphicsState>>,
     queue_state: AtomicU8,
     made: OnceLock<Option<HostPipeline>>,
+    /// Signalled when `made` is set: a draw or dispatch sleeps only on its
+    /// own pipeline's condvar. A shared one was signalled at every make,
+    /// waking every waiting draw for each pipeline finished (a frame that
+    /// wants 1,200 pipelines made: up to a thousand wake-ups per waiter).
+    done: (Mutex<()>, Condvar),
+    /// Waits on `done` under way (registered under `done.0` before `made`
+    /// is looked at, so a `make` that passes the count cannot miss one).
+    waiters: AtomicUsize,
     /// What identifies it across runs (shader containers and state), and
     /// whether a draw or dispatch has requested it yet.
     key: String,
@@ -42,13 +50,22 @@ unsafe impl Send for Pending {}
 unsafe impl Sync for Pending {}
 
 impl Pending {
-    pub(crate) fn new(shaders: Vec<Arc<Shader>>, graphics: Option<Box<GraphicsState>>) -> Pending {
+    /// The `key` [`hand_out`](super::hand_out) already computed for the
+    /// dedupe map (hashing the shaders and the graphics state again under
+    /// its lock kept the title's other creates waiting).
+    pub(crate) fn new(
+        shaders: Vec<Arc<Shader>>,
+        graphics: Option<Box<GraphicsState>>,
+        key: String,
+    ) -> Pending {
         Pending {
-            key: key(&shaders, graphics.as_deref()),
+            key,
             shaders,
             graphics,
             queue_state: AtomicU8::new(NOT_QUEUED),
             made: OnceLock::new(),
+            done: (Mutex::new(()), Condvar::new()),
+            waiters: AtomicUsize::new(0),
             used: AtomicBool::new(false),
         }
     }
@@ -56,15 +73,22 @@ impl Pending {
     fn make(&self) {
         self.made
             .get_or_init(|| HostPipeline::new(&self.shaders, self.graphics.as_deref()));
-        let (lock, done) = &DONE;
-        let _held = lock.lock().unwrap_or_else(|e| e.into_inner());
-        done.notify_all();
+        // Wake this pipeline's waiters only. `made` is stored before this
+        // read; a waiter increments `waiters` before it looks at `made`,
+        // so one the count misses is one that will see `made` and not
+        // sleep: no wakeup is lost.
+        if self.waiters.load(Ordering::SeqCst) > 0 {
+            let _held = self.done.0.lock().unwrap_or_else(|e| e.into_inner());
+            self.done.1.notify_all();
+            #[cfg(test)]
+            NOTIFIED.fetch_add(1, Ordering::Relaxed);
+        }
     }
 }
 
-/// What identifies a pipeline across runs (shader containers and state):
-/// the `key` `Pending::new` computes, made before one exists so identical
-/// title pipelines can share one (`hand_out`).
+/// What identifies a pipeline across runs (shader containers and state),
+/// made before a `Pending` exists so identical title pipelines can share
+/// one (`hand_out`), which then hands it to `Pending::new`.
 pub(crate) fn key(shaders: &[Arc<Shader>], graphics: Option<&GraphicsState>) -> String {
     let mut key = blake3::Hasher::new();
     for s in shaders {
@@ -98,8 +122,10 @@ pub(crate) fn missing(p: &Pending) -> Option<String> {
     }
 }
 
-/// Signalled whenever a worker has made a pipeline.
-static DONE: (Mutex<()>, Condvar) = (Mutex::new(()), Condvar::new());
+/// Broadcasts on a pending pipeline's condvar, for the tests (a wake of
+/// the other side is observable only up to an OS spurious wake-up).
+#[cfg(test)]
+static NOTIFIED: AtomicU64 = AtomicU64::new(0);
 
 /// Waiting allowed per title frame, over all threads.
 fn wait_budget() -> Duration {
@@ -130,10 +156,12 @@ pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
     if !p.used.load(Ordering::Relaxed) && !p.used.swap(true, Ordering::Relaxed) {
         super::library::note_used(&p.key);
     }
-    if p.made.get().is_none() {
-        start(p, REQUESTED);
-        wait(p, crate::frame::current());
+    // The common case - a made pipeline - is one look, no queue, no wait.
+    if let Some(made) = p.made.get() {
+        return made.as_ref();
     }
+    start(p, REQUESTED);
+    wait(p, crate::frame::current());
     p.made.get()?.as_ref()
 }
 
@@ -191,15 +219,23 @@ fn wait(p: &Pending, frame: u64) {
         return;
     }
     let started = Instant::now();
-    let (lock, done) = &DONE;
+    let (lock, done) = &p.done;
     let mut held = lock.lock().unwrap_or_else(|e| e.into_inner());
+    // Registered before `made` is looked at: a `make` that stores it and
+    // then finds the count still at zero is ordered before this, and the
+    // first check below sees the store (no lost wakeup).
+    p.waiters.fetch_add(1, Ordering::SeqCst);
     while p.made.get().is_none() {
         let rest = left.saturating_sub(started.elapsed());
         if rest.is_zero() {
             break;
         }
-        held = done.wait_timeout(held, rest).unwrap_or_else(|e| e.into_inner()).0;
+        held = done
+            .wait_timeout(held, rest)
+            .unwrap_or_else(|e| e.into_inner())
+            .0;
     }
+    p.waiters.fetch_sub(1, Ordering::SeqCst);
     drop(held);
     let waited = started.elapsed().min(left);
     {
@@ -356,11 +392,17 @@ fn drained() {
 mod tests {
     use super::*;
 
+    /// A `Pending` whose key the caller already computed (as `hand_out`
+    /// does for its dedupe map).
+    fn pending(shaders: Vec<Arc<Shader>>) -> Pending {
+        Pending::new(shaders.clone(), None, key(&shaders, None))
+    }
+
     /// A first use queues the pipeline and, within the budget, gets the
     /// worker's answer (here: no host pipeline for no shaders).
     #[test]
     fn first_use_is_made_by_a_worker() {
-        let p = Arc::new(Pending::new(Vec::new(), None));
+        let p = Arc::new(pending(Vec::new()));
         assert!(ready(&p).is_none());
         assert_ne!(p.queue_state.load(Ordering::Relaxed), NOT_QUEUED);
         let started = Instant::now();
@@ -372,7 +414,7 @@ mod tests {
 
     #[test]
     fn pending_pipeline_is_recorded_for_the_next_launch() {
-        let mut p = Pending::new(Vec::new(), None);
+        let mut p = pending(Vec::new());
         p.key = "pending-pipeline-test".to_owned();
         // Simulate a worker that has taken the job but cannot finish it yet.
         p.queue_state.store(MAKING, Ordering::Relaxed);
@@ -384,11 +426,54 @@ mod tests {
         assert!(super::super::library::wanted_early(&p.key));
     }
 
+    /// A pipeline made wakes the draws waiting on it and no others: the
+    /// shared condvar used to wake every waiting draw at every make.
+    #[test]
+    fn a_make_wakes_only_its_own_waiters() {
+        let waiting = Arc::new(pending(Vec::new()));
+        let made = Arc::new(pending(Vec::new()));
+        // A frame of its own: the budget for the run's real frame may be
+        // taken by other tests. As draws do, the sleeper tries again
+        // while nothing was made.
+        let frame = crate::frame::current() + 1_000_000;
+        let w = waiting.clone();
+        let sleeper = std::thread::spawn(move || {
+            while w.made.get().is_none() {
+                wait(&w, frame);
+                std::thread::yield_now();
+            }
+        });
+        // Let the sleeper reach `waiting`'s condvar first (a budget of
+        // zero registers no waiter at all; the count of broadcasts is
+        // then all the check there is).
+        let give_up = Instant::now() + Duration::from_secs(5);
+        while waiting.waiters.load(Ordering::Relaxed) == 0 && Instant::now() < give_up {
+            std::thread::yield_now();
+        }
+        let notified = NOTIFIED.load(Ordering::Relaxed);
+        made.make();
+        assert_eq!(
+            NOTIFIED.load(Ordering::Relaxed),
+            notified,
+            "a pipeline with nobody waiting on it still signalled"
+        );
+        waiting.make();
+        if waiting.waiters.load(Ordering::Relaxed) > 0 {
+            assert_eq!(
+                NOTIFIED.load(Ordering::Relaxed),
+                notified + 1,
+                "a waiting draw was not told its pipeline was made"
+            );
+        }
+        sleeper.join().unwrap();
+        assert!(waiting.made.get().is_some());
+    }
+
     #[test]
     fn draws_promote_early_pipelines_without_claiming_them_twice() {
-        let earlier = Arc::new(Pending::new(Vec::new(), None));
-        let promoted = Arc::new(Pending::new(Vec::new(), None));
-        let requested = Arc::new(Pending::new(Vec::new(), None));
+        let earlier = Arc::new(pending(Vec::new()));
+        let promoted = Arc::new(pending(Vec::new()));
+        let requested = Arc::new(pending(Vec::new()));
         let mut queue = Queue::new();
 
         assert_eq!(queue.push(&earlier, EARLY), Some(true));

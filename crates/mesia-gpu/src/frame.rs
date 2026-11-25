@@ -113,6 +113,68 @@ fn next_tick(kind: u32) -> (u64, Duration) {
     )
 }
 
+/// Sleeps for `wait`. A waitable timer created high-resolution wakes
+/// within ~0.5 ms of when it was due; `Sleep` waits in timer ticks (a
+/// whole 15.6 ms until the run asks for finer, 1 ms then), and
+/// `thread::sleep` truncates to whole milliseconds, ending a
+/// sub-millisecond wait a tick early.
+#[cfg(windows)]
+fn sleep_for(wait: Duration) {
+    use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
+    use windows_sys::Win32::System::Threading::*;
+    /// One high-resolution waitable timer per waiting thread.
+    struct Timer(HANDLE);
+    impl Timer {
+        fn new() -> Option<Timer> {
+            // SAFETY: creates one kernel object for this thread.
+            let handle = unsafe {
+                CreateWaitableTimerExW(
+                    std::ptr::null(),
+                    std::ptr::null(),
+                    CREATE_WAITABLE_TIMER_MANUAL_RESET | CREATE_WAITABLE_TIMER_HIGH_RESOLUTION,
+                    TIMER_ALL_ACCESS,
+                )
+            };
+            (!handle.is_null()).then_some(Timer(handle))
+        }
+    }
+    impl Drop for Timer {
+        fn drop(&mut self) {
+            // SAFETY: the thread's own handle.
+            unsafe { CloseHandle(self.0) };
+        }
+    }
+    thread_local! {
+        static TIMER: std::cell::RefCell<Option<Timer>> = const { std::cell::RefCell::new(None) };
+    }
+    // A relative due time in 100 ns intervals, rounded up so the wait
+    // does not end before `wait`.
+    let due = -i64::try_from(wait.as_nanos().saturating_add(99) / 100).unwrap_or(i64::MAX);
+    let waited = TIMER.with(|timer| {
+        let mut timer = timer.borrow_mut();
+        if timer.is_none() {
+            *timer = Timer::new();
+        }
+        let Some(timer) = &*timer else { return false };
+        // SAFETY: the thread's own timer; `due` is a relative 100 ns time.
+        unsafe {
+            SetWaitableTimer(timer.0, &due, 0, None, std::ptr::null(), 0) != 0 && {
+                WaitForSingleObject(timer.0, INFINITE);
+                true
+            }
+        }
+    });
+    if !waited {
+        std::thread::sleep(wait);
+    }
+}
+
+/// Sleeps for `wait` (see the Windows one above).
+#[cfg(not(windows))]
+fn sleep_for(wait: Duration) {
+    std::thread::sleep(wait);
+}
+
 /// Device method: blocks until the next tick (or the time-out); an origin
 /// wait then hands out the new frame's token. Other events keep the token
 /// the title passes. Ticks are absolute (start plus whole intervals), so
@@ -143,10 +205,10 @@ pub(crate) extern "system" fn wait(
         wait = Duration::ZERO;
     }
     let hr = if wait > limit {
-        std::thread::sleep(limit);
+        sleep_for(limit);
         TIMEOUT
     } else {
-        std::thread::sleep(wait);
+        sleep_for(wait);
         last(kind).fetch_max(tick, Ordering::Relaxed);
         S_OK
     };
@@ -242,5 +304,55 @@ mod tests {
         // Even when a flip wait begins on the tick another just ended on.
         let (tick, _) = next_tick(FLIP);
         assert!(tick > flips[3]);
+    }
+
+    /// The wait's sleep still sleeps, for zero and sub-millisecond waits
+    /// too (a waitable timer fails to be created nowhere sane, but the
+    /// fallback must behave as well).
+    #[test]
+    fn the_wait_sleep_sleeps() {
+        for wait in [
+            Duration::ZERO,
+            Duration::from_micros(300),
+            Duration::from_millis(4),
+        ] {
+            let started = Instant::now();
+            sleep_for(wait);
+            assert!(started.elapsed() < Duration::from_millis(500), "{wait:?}");
+        }
+    }
+
+    /// `MESIA_PACE_BENCH=1`: overshoot of `thread::sleep` and `sleep_for`
+    /// for waits the frame clock hands out, printed rather than asserted
+    /// (the machine's timer decides the numbers).
+    #[test]
+    fn sleep_precision_bench() {
+        if std::env::var_os("MESIA_PACE_BENCH").is_none() {
+            return;
+        }
+        for wait in [
+            Duration::from_micros(500),
+            Duration::from_millis(4),
+            SIXTIETH,
+        ] {
+            for (name, f) in [
+                ("thread::sleep", std::thread::sleep as fn(Duration)),
+                ("sleep_for", sleep_for as fn(Duration)),
+            ] {
+                let mut overs: Vec<Duration> = (0..20)
+                    .map(|_| {
+                        let started = Instant::now();
+                        f(wait);
+                        started.elapsed().saturating_sub(wait)
+                    })
+                    .collect();
+                overs.sort();
+                eprintln!(
+                    "{name} {wait:?}: overshoot median {:?}, max {:?}",
+                    overs[overs.len() / 2],
+                    overs[overs.len() - 1]
+                );
+            }
+        }
     }
 }

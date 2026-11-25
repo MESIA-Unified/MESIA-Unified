@@ -6,7 +6,7 @@
 //! the immediate samplers, and directly indexed heaps.
 
 use std::ffi::{CStr, CString};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock};
 
 use mesia_shader::emit::{ROOT_CBV_SPACE, SAMPLER_SPACE, USER_DATA_SPACE};
 use windows::Win32::Graphics::Direct3D::ID3DBlob;
@@ -32,6 +32,10 @@ pub(crate) struct GraphicsState {
     pub(crate) targets: D3D12_RT_FORMAT_ARRAY,
     depth_format: DXGI_FORMAT,
     samples: DXGI_SAMPLE_DESC,
+    /// [`describe`], computed once: the key a title pipeline is deduped
+    /// by and the state part of its name in the library are the same
+    /// text (a few dozen fields formatted per call).
+    described: OnceLock<String>,
 }
 
 impl Default for GraphicsState {
@@ -85,6 +89,7 @@ impl Default for GraphicsState {
                 Count: 1,
                 Quality: 0,
             },
+            described: OnceLock::new(),
         }
     }
 }
@@ -182,7 +187,12 @@ impl GraphicsState {
 
     /// Everything the state holds, as text: part of a pipeline's name in
     /// the library and of the key a title pipeline is started early by.
-    pub(crate) fn describe(&self) -> String {
+    /// Made once: the state is not written after the create call.
+    pub(crate) fn describe(&self) -> &str {
+        self.described.get_or_init(|| self.describe_now())
+    }
+
+    fn describe_now(&self) -> String {
         let inputs: Vec<String> = self
             .inputs
             .iter()
@@ -194,6 +204,14 @@ impl GraphicsState {
                 )
             })
             .collect();
+        // The topology the host pipeline is made with: quads draw as
+        // triangles on it (`HostPipeline::new` maps both to TRIANGLE), so
+        // the same description names the same pipeline here. Rectangles
+        // keep their own value: theirs gets a geometry stage.
+        let topology = match self.topology.0 {
+            QUADS => D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE.0,
+            t => t,
+        };
         format!(
             "{:?} {} {:?} {:?} {inputs:?} {} {} {:?} {} {:?}",
             self.blend,
@@ -201,7 +219,7 @@ impl GraphicsState {
             self.rasterizer,
             self.depth,
             self.strip_cut.0,
-            self.topology.0,
+            topology,
             self.targets,
             self.depth_format.0,
             self.samples
@@ -555,7 +573,7 @@ impl HostPipeline {
                 "mesh triangles",
                 &root_blob,
                 &[&code_bytes(&code(0)), &code_bytes(&code(1))],
-                &state,
+                state,
             );
             let pso = match mesh_pipeline(&host.device, &root, code(0), code(1), g, &name) {
                 Ok(pso) => pso,
@@ -633,13 +651,13 @@ impl HostPipeline {
                 "graphics rectangles",
                 &root_blob,
                 &[&code_bytes(&code(0)), &code_bytes(&code(1)), &gs[..]],
-                &state,
+                state,
             ),
             None => super::library::name(
                 "graphics",
                 &root_blob,
                 &[&code_bytes(&code(0)), &code_bytes(&code(1))],
-                &state,
+                state,
             ),
         };
         let make = |desc: &D3D12_GRAPHICS_PIPELINE_STATE_DESC, name: &str| {
@@ -796,12 +814,14 @@ fn code_bytes(code: &D3D12_SHADER_BYTECODE) -> Vec<u8> {
     unsafe { std::slice::from_raw_parts(code.pShaderBytecode.cast::<u8>(), code.BytecodeLength) }.to_vec()
 }
 
-fn root_signature(
-    device: &ID3D12Device,
+/// The serialized description of the root signature `params`, `samplers`
+/// and `compute` describe (the cache key of [`root_signature`], and part
+/// of a pipeline's name in the library).
+fn serialized_signature(
     params: &[D3D12_ROOT_PARAMETER1],
     samplers: &[D3D12_STATIC_SAMPLER_DESC],
     compute: bool,
-) -> windows::core::Result<(ID3D12RootSignature, Vec<u8>)> {
+) -> windows::core::Result<Vec<u8>> {
     let input = if compute {
         D3D12_ROOT_SIGNATURE_FLAG_NONE
     } else {
@@ -839,8 +859,38 @@ fn root_signature(
         let blob = blob.ok_or_else(windows::core::Error::empty)?;
         let bytes =
             std::slice::from_raw_parts(blob.GetBufferPointer().cast::<u8>(), blob.GetBufferSize());
-        Ok((device.CreateRootSignature(0, bytes)?, bytes.to_vec()))
+        Ok(bytes.to_vec())
     }
+}
+
+/// The root signature for `params` and `samplers`: shared by every
+/// pipeline that binds the same way rather than serialized and created
+/// again per pipeline (the signature is part of the library name already,
+/// so the same bytes would make the same object again). A second thread
+/// creating the same one concurrently loses nothing but the duplicate.
+fn root_signature(
+    device: &ID3D12Device,
+    params: &[D3D12_ROOT_PARAMETER1],
+    samplers: &[D3D12_STATIC_SAMPLER_DESC],
+    compute: bool,
+) -> windows::core::Result<(ID3D12RootSignature, Vec<u8>)> {
+    static ROOTS: Mutex<Option<std::collections::HashMap<Vec<u8>, ID3D12RootSignature>>> =
+        Mutex::new(None);
+    let bytes = serialized_signature(params, samplers, compute)?;
+    let mut roots = ROOTS.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(root) = roots.get_or_insert_with(Default::default).get(&bytes) {
+        return Ok((root.clone(), bytes));
+    }
+    drop(roots);
+    // SAFETY: the serialized description outlives the call.
+    let made = unsafe { device.CreateRootSignature(0, &bytes) }?;
+    let mut roots = ROOTS.lock().unwrap_or_else(|e| e.into_inner());
+    let root = roots
+        .get_or_insert_with(Default::default)
+        .entry(bytes.clone())
+        .or_insert(made)
+        .clone();
+    Ok((root, bytes))
 }
 
 #[cfg(test)]
@@ -919,13 +969,58 @@ mod tests {
         g.depth.DepthEnable = false.into();
         g.targets.NumRenderTargets = 1;
         g.targets.RTFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
-        let name = super::super::library::name("mesh test", &root_blob, &[&ms, &ps], &g.describe());
+        let name = super::super::library::name("mesh test", &root_blob, &[&ms, &ps], g.describe());
         mesh_pipeline(&host.device, &root, code(&ms), code(&ps), &g, &name).expect("made");
         let loaded = super::super::library::LOADED.load(Ordering::Relaxed);
         mesh_pipeline(&host.device, &root, code(&ms), code(&ps), &g, &name).expect("made again");
         assert!(
             super::super::library::LOADED.load(Ordering::Relaxed) > loaded,
             "the mesh pipeline was compiled again instead of loaded from the library"
+        );
+    }
+
+    /// The graphics state's text is made once, then kept: the dedupe key
+    /// and the library name take the same text.
+    #[test]
+    fn the_state_text_is_made_once() {
+        let g = GraphicsState::default();
+        let first = g.describe();
+        assert!(!first.is_empty());
+        assert_eq!(first.as_ptr(), g.describe().as_ptr(), "described again");
+    }
+
+    /// Quads and triangles are the same pipeline on the host (the
+    /// description's topology is TRIANGLE for both), so their texts are
+    /// the same; a rectangle pipeline's differs (its geometry stage).
+    #[test]
+    fn quads_describe_as_the_triangles_they_draw() {
+        let mut triangles = GraphicsState::default();
+        triangles.topology = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+        let mut quads = GraphicsState::default();
+        quads.topology = D3D12_PRIMITIVE_TOPOLOGY_TYPE(QUADS);
+        assert_eq!(triangles.describe(), quads.describe());
+        let mut rects = GraphicsState::default();
+        rects.topology = D3D12_PRIMITIVE_TOPOLOGY_TYPE(RECTANGLES);
+        assert_ne!(triangles.describe(), rects.describe());
+    }
+
+    /// Pipelines that bind the same way share one host root signature:
+    /// its serialized description is the key, the create happens once.
+    #[test]
+    fn pipelines_share_a_root_signature() {
+        use windows::core::Interface;
+        let a = serialized_signature(&[], &[], false).unwrap();
+        assert_eq!(a, serialized_signature(&[], &[], false).unwrap());
+        assert_ne!(a, serialized_signature(&[], &[], true).unwrap());
+        let Some(host) = host() else {
+            return; // no host GPU here
+        };
+        let (first, _) = root_signature(&host.device, &[], &[], false).unwrap();
+        let (second, _) = root_signature(&host.device, &[], &[], false).unwrap();
+        assert_eq!(
+            first.as_raw(),
+            second.as_raw(),
+            "a shared root signature was created again"
         );
     }
 }

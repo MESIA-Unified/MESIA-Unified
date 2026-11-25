@@ -61,6 +61,11 @@ pub(crate) struct Shader {
     /// The first 8 bytes of its BLAKE3, as logged.
     pub(crate) hash: String,
     container: Vec<u8>,
+    /// Whether a compute pipeline of this shader is one of the ray-tracing
+    /// structure builder's ([`of_builder`]): parsing its container to know
+    /// happens once per container, not once per pipeline created from it.
+    #[cfg(windows)]
+    builder: OnceLock<bool>,
     #[cfg(windows)]
     translated: OnceLock<Option<Translated>>,
 }
@@ -111,6 +116,8 @@ fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
                 stage,
                 hash: full.to_hex()[..16].to_owned(),
                 container: bytes.to_vec(),
+                #[cfg(windows)]
+                builder: OnceLock::new(),
                 #[cfg(windows)]
                 translated: OnceLock::new(),
             })
@@ -238,15 +245,19 @@ static BUILDER: Mutex<Builder> = Mutex::new(Builder {
 fn of_builder(shaders: &[Arc<Shader>]) -> bool {
     use mesia_shader::{Container, FourCC};
     let [shader] = shaders else { return false };
-    if shader.stage != "compute" {
-        return false;
-    }
-    let Ok(c) = Container::parse(&shader.container) else {
-        return false;
-    };
-    c.part(FourCC::DXIL)
-        .and_then(|part| mesia_shader::native_programs(part.data).ok())
-        .is_some_and(|programs| programs.iter().any(mesia_shader::spill::is_spilled))
+    // Memoized on the shader: its container is parsed and its program
+    // decoded once, not at every compute pipeline created from it.
+    *shader.builder.get_or_init(|| {
+        if shader.stage != "compute" {
+            return false;
+        }
+        let Ok(c) = Container::parse(&shader.container) else {
+            return false;
+        };
+        c.part(FourCC::DXIL)
+            .and_then(|part| mesia_shader::native_programs(part.data).ok())
+            .is_some_and(|programs| programs.iter().any(mesia_shader::spill::is_spilled))
+    })
 }
 
 /// `MESIA_BVH_QUARANTINE=1`: what the structure builder's stages store
@@ -514,7 +525,7 @@ fn hand_out(
             None => {
                 // A dead entry goes only when its key comes up again.
                 pendings.remove(&key);
-                let p = Arc::new(make::Pending::new(shaders.clone(), graphics));
+                let p = Arc::new(make::Pending::new(shaders.clone(), graphics, key.clone()));
                 pendings.insert(key, Arc::downgrade(&p));
                 p
             }
@@ -802,6 +813,21 @@ mod tests {
             &pipeline(q).shaders[1]
         ));
         assert_eq!(slot::<extern "system" fn(This) -> u32>(p, 0x10)(p), 0);
+    }
+
+    /// A compute shader's container is parsed and decoded once to know
+    /// whether it is a stage of the structure builder, not at every
+    /// pipeline created from it.
+    #[cfg(windows)]
+    #[test]
+    fn builder_check_is_memoized_per_shader() {
+        let cs = shader("compute", &[0xde, 0xad, 0xbe, 0xef]);
+        assert!(!of_builder(std::slice::from_ref(&cs)));
+        assert_eq!(cs.builder.get(), Some(&false), "the parse was not kept");
+        let vs = shader("vertex", &[1, 2, 3]);
+        assert!(!of_builder(std::slice::from_ref(&vs)));
+        assert_eq!(vs.builder.get(), Some(&false));
+        assert!(!of_builder(&[cs.clone(), cs]));
     }
 
     /// The stream layout the title builds (title+0x86f090): root
