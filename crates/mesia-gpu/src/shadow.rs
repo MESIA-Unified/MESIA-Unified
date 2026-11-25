@@ -871,6 +871,42 @@ fn give_back(v: Vec<u8>) {
     });
 }
 
+#[cfg(test)]
+mod pool_tests {
+    use super::{POOL, give_back, pooled};
+
+    /// A buffer given back to the pool serves the next ask it fits — the
+    /// same allocation, cleared — and the smallest that fits is taken;
+    /// an ask nothing fits gets fresh memory (`pooled` gives a buffer or
+    /// `None` under memory pressure, never the biggest buffer it has).
+    #[test]
+    fn pooled_buffers_come_back_for_the_asks_they_fit() {
+        // (what earlier tests left in the shared pool would answer first)
+        POOL.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        let fresh = pooled(1 << 20).expect("a 1 MiB snapshot buffer");
+        let (first, cap) = (fresh.as_ptr(), fresh.capacity());
+        give_back(fresh);
+        // The ask the buffer fits takes it back: the same allocation.
+        let reused = pooled(cap).expect("the pool's own buffer back");
+        assert_eq!(reused.as_ptr(), first, "the kept allocation is reused");
+        assert!(reused.is_empty());
+        // Of several kept it is the smallest that fits.
+        let eight = Vec::<u8>::with_capacity(8 << 20);
+        let eight_cap = eight.capacity();
+        give_back(reused);
+        give_back(Vec::<u8>::with_capacity(2 << 20));
+        give_back(eight);
+        let fit = pooled(1 << 20).expect("a fitting buffer");
+        assert_eq!(fit.as_ptr(), first);
+        // Of the two left only the biggest fits a 4 MiB ask.
+        assert_eq!(pooled(4 << 20).expect("the one buffer that fits").capacity(), eight_cap);
+        // The 2 MiB left fits no 3 MiB ask: fresh memory.
+        let rest = pooled(3 << 20).expect("fresh memory when nothing fits");
+        assert!(rest.capacity() >= 3 << 20);
+        give_back(rest);
+    }
+}
+
 const NOT_WATCHED: u8 = 2;
 
 /// Where `a` and `b` (of one length) first differ, compared eight bytes at
