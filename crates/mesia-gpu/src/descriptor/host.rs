@@ -24,8 +24,8 @@ pub(crate) struct HostHeap {
     /// ours keeps 2^18 there: 2^16 and 2^17 both ran out in this title.)
     dynamic: u32,
     sampler: bool,
-    /// The record (view index and generation) each slot was last made from.
-    made: Mutex<Vec<u64>>,
+    /// What each slot was last made from ([`Made`]).
+    made: Mutex<Vec<Made>>,
     /// The host resource each slot views, held while the slot does: shaders
     /// index heaps directly, so a slot the title has not rewritten since it
     /// released the resource may still be read, and a freed host resource
@@ -109,6 +109,44 @@ enum Deferred {
     /// A null view of the kind the slot's `made` key held (`unmake`);
     /// the slot's `made` entry is already cleared.
     Null(u64),
+}
+
+/// What a title slot was last made from, and what that resolved to.
+/// `key` is the record's (view index, generation) pair, 0 when the slot
+/// shows a null view; `shown` is the view the record named and the host
+/// copy its buffer view was made on — a draw that finds the same record
+/// still there takes them without the views table or the copies map.
+#[derive(Default, Clone)]
+struct Made {
+    key: u64,
+    shown: Option<std::sync::Arc<Shown>>,
+}
+
+/// What a made slot's record names, resolved once per make
+/// ([`HostHeap::mirror_shown`]): the view, and `buffer_copy(&view)` for
+/// a buffer view (the host copy the slot's view was made on, not another
+/// the view's range alone would find).
+pub(crate) struct Shown {
+    /// The key of the record this was resolved from — its (view index,
+    /// generation) pair — for the `cached` check in `mirror_shown`.
+    pub(crate) key: u64,
+    /// The view the record names.
+    pub(crate) view: super::View,
+    /// `buffer_copy(&view)`, resolved when the slot was made (`None` for
+    /// views without a buffer range, and when the making path did not
+    /// resolve one — resolve with `buffer_copy`).
+    pub(crate) copy: Option<(std::sync::Arc<crate::shadow::Shadow>, u64, u64)>,
+    /// The [`super::views_epoch`] this was resolved at: past it, view
+    /// entries were freed and the view is re-checked before it is used.
+    epoch: u64,
+}
+
+impl Shown {
+    /// The copy of [`Shown::copy`], resolving it as [`buffer_copy`]
+    /// would when the making path did not.
+    pub(crate) fn copy_or_find(&self) -> Option<(std::sync::Arc<crate::shadow::Shadow>, u64, u64)> {
+        self.copy.clone().or_else(|| buffer_copy(&self.view))
+    }
 }
 
 /// Writes put off past this many stand the writer until the card is
@@ -681,7 +719,7 @@ impl HostHeap {
             count,
             dynamic: extra,
             sampler,
-            made: Mutex::new(vec![0; count as usize]),
+            made: Mutex::new(vec![Made::default(); count as usize]),
             kept: Mutex::new(vec![None; (count + extra) as usize]),
             next: Mutex::new((0, vec![false; DYNAMIC as usize])),
             free: std::sync::atomic::AtomicU32::new(DYNAMIC),
@@ -914,7 +952,7 @@ impl HostHeap {
     /// keeps what it views). True if the slot was made.
     pub(crate) fn texture_slot_gone(&self, index: u32) -> bool {
         let mut made = self.made.lock().unwrap_or_else(|e| e.into_inner());
-        if made.get(index as usize).is_none_or(|&key| key == 0) {
+        if made.get(index as usize).is_none_or(|m| m.key == 0) {
             return false;
         }
         self.unmake(&mut made, index);
@@ -926,8 +964,8 @@ impl HostHeap {
     /// made: a null view of the kind it held. With a submission in the
     /// air the heap write waits in `deferred` for a boundary with none;
     /// the slot's `made` entry is cleared at once.
-    fn unmake(&self, made: &mut [u64], index: u32) {
-        let Some(key) = made.get_mut(index as usize).map(std::mem::take) else {
+    fn unmake(&self, made: &mut [Made], index: u32) {
+        let Some(Made { key, .. }) = made.get_mut(index as usize).map(std::mem::take) else {
             return;
         };
         if key == 0 {
@@ -1151,13 +1189,23 @@ impl HostHeap {
     }
 
     /// Makes slot `index` (a dynamic one) from `view`; a null view if the
-    /// host cannot.
-    pub(crate) fn make_at(&self, index: u32, view: &View) {
+    /// host cannot. Returns the host copy a buffer view was made on, as
+    /// `Shown::copy` ([`buffer_copy`]).
+    pub(crate) fn make_at(
+        &self,
+        index: u32,
+        view: &View,
+    ) -> Option<(std::sync::Arc<crate::shadow::Shadow>, u64, u64)> {
         let kept = make(view, self.cpu(index));
         if kept.is_none() {
             null_for(view, self.cpu(index));
         }
-        self.keep(index, kept.flatten());
+        let copy = kept
+            .as_ref()
+            .and_then(|kept| kept.copy.clone())
+            .and_then(|shadow| buffer_range(view).map(|(a, l)| (shadow, a, l)));
+        self.keep(index, kept.and_then(|kept| kept.resource));
+        copy
     }
 
     /// Makes slot `index` read nothing: a null view, or a plain sampler.
@@ -1312,6 +1360,13 @@ impl HostHeap {
     /// draw's), so the queue stays within the heap's slot count.
     fn defer(&self, index: u32, op: Deferred) {
         let mut deferred = self.deferred.lock().unwrap_or_else(|e| e.into_inner());
+        // The same op stands for the slot already — a draw's read of an
+        // unchanged record defers it once for the whole flight, and a
+        // changed record defers its own; the write the queue holds is
+        // the one that lands either way.
+        if deferred.get(&index) == Some(&op) {
+            return;
+        }
         if let (Some(&Deferred::Mirror(_, for_draw)), Deferred::Mirror(handle, draw)) =
             (deferred.get(&index), op)
         {
@@ -1369,7 +1424,7 @@ impl HostHeap {
             }
             match op {
                 Deferred::Mirror(handle, for_draw) => {
-                    let _ = self.mirror_locked(&mut made, index, handle, for_draw);
+                    let _ = self.mirror_shown_locked(&mut made, index, handle, for_draw);
                 }
                 Deferred::Null(key) => self.null_made(index, key),
             }
@@ -1385,6 +1440,29 @@ impl HostHeap {
     /// shaders index the heap directly), and the caller still gets the
     /// view: the slot goes on showing what it had, stale but whole.
     pub(crate) fn mirror(&self, index: u32, handle: u64, for_draw: bool) -> Option<View> {
+        self.mirror_shown(index, handle, for_draw, None)
+            .map(|(shown, _)| shown.view.clone())
+    }
+
+    /// [`HostHeap::mirror`] returning the resolved [`Shown`] — the view
+    /// and, for a buffer view the slot was made from, its host copy —
+    /// so a draw repeats neither the views-table nor the copies-map
+    /// look-up. `cached` is the `Shown` this caller got for the slot
+    /// last: while a submission is in the air it is all the look-up
+    /// there is — the record's key matching means nothing resolved is
+    /// stale (`super::views_epoch` has not moved).
+    /// The flag is whether `Shown::copy` is the copy the slot's shaders
+    /// will read: true with the slot made, false while a submission is
+    /// in the air — the write the queue holds makes the slot then, on
+    /// whatever copy `find` gives a flush (the captured one may be let
+    /// go meanwhile, so a `buffer_copy` look-up stands closer to it).
+    pub(crate) fn mirror_shown(
+        &self,
+        index: u32,
+        handle: u64,
+        for_draw: bool,
+        cached: Option<&std::sync::Arc<Shown>>,
+    ) -> Option<(std::sync::Arc<Shown>, bool)> {
         if index >= self.count {
             // Diagnostic (NVIDIA heap cap): the highest title slot past the
             // host heap seen so far.
@@ -1401,34 +1479,71 @@ impl HostHeap {
         }
         if in_the_air() {
             self.defer(index, Deferred::Mirror(handle, for_draw));
-            return super::view(handle);
+            // The record's view is found: `made` cannot know the
+            // writing to land — nor the slot's content then — so the
+            // record has to resolve to the view's holder. The caller's
+            // `cached` for this slot already is that holder while the
+            // record's key and the views table's epoch are unchanged.
+            // SAFETY: the handle is a descriptor slot in title memory.
+            let [tag, i, generation] = unsafe { (handle as *const [u32; 3]).read_unaligned() };
+            let key = u64::from(generation) << 32 | u64::from(i);
+            if tag == VIEW_TAG
+                && let Some(shown) = cached
+                && shown.key == key
+                && shown.epoch == super::views_epoch()
+            {
+                return Some((shown.clone(), false));
+            }
+            let view = super::view(handle)?;
+            return Some((
+                std::sync::Arc::new(Shown {
+                    key,
+                    view,
+                    copy: None,
+                    epoch: super::views_epoch(),
+                }),
+                false,
+            ));
         }
         if self.deferred_n.load(std::sync::atomic::Ordering::Relaxed) > 0 {
             // Idle again: writes that waited land first, then this one's.
             self.flush_deferred();
         }
         let mut made = self.made.lock().unwrap_or_else(|e| e.into_inner());
-        self.mirror_locked(&mut made, index, handle, for_draw)
+        self.mirror_shown_locked(&mut made, index, handle, for_draw)
+            .map(|shown| (shown, true))
     }
 
-    /// [`HostHeap::mirror`] with `made` held.
-    fn mirror_locked(
+    /// [`HostHeap::mirror_shown`] with `made` held.
+    fn mirror_shown_locked(
         &self,
-        made: &mut [u64],
+        made: &mut [Made],
         index: u32,
         handle: u64,
         for_draw: bool,
-    ) -> Option<View> {
+    ) -> Option<std::sync::Arc<Shown>> {
         // SAFETY: the handle is a descriptor slot in title memory.
         let [tag, i, generation] = unsafe { (handle as *const [u32; 3]).read_unaligned() };
         // Generations start at 1, so a made slot's key is never 0.
         let key = u64::from(generation) << 32 | u64::from(i);
+        // The record names the view the slot was made from and the views
+        // table has not freed any view since — `shown` stands, and the
+        // views table and the copies map go unread. The epoch is what
+        // makes the read of title memory alone enough: a freed entry
+        // moves it, and `shown` is re-resolved below.
+        if tag == VIEW_TAG
+            && made[index as usize].key == key
+            && let Some(shown) = &made[index as usize].shown
+            && shown.epoch == super::views_epoch()
+        {
+            return Some(shown.clone());
+        }
         let view = (tag == VIEW_TAG).then(|| view_at(i, generation)).flatten();
         let Some(view) = view else {
             // Not a view of ours (never written, or of a resource the
             // title released): nothing to read.
-            if made[index as usize] != 0 {
-                made[index as usize] = 0;
+            if made[index as usize].key != 0 {
+                made[index as usize] = Made::default();
                 self.make_null(index);
                 let _ = self.note_buffer(index, None, false);
             } else if for_draw {
@@ -1437,51 +1552,92 @@ impl HostHeap {
             }
             return None;
         };
-        if made[index as usize] != key {
-            // Views of other textures in the memory this one describes
-            // are stale: their host slots read nothing from here on, and
-            // let go of the host copies they held.
-            for stale in self.note_buffer(index, Some(&view), for_draw) {
-                if stale != index {
-                    self.unmake(made, stale);
-                }
-            }
-            // A view of a texture object that has no host copy yet waits
-            // for it, as buffer views wait for a draw: the slot is made
-            // when the texture is first used (`super::make_waiting`), or
-            // here when a draw reads the slot through a table.
-            let waiting = if for_draw { None } else { view.waiting_texture() };
-            if let Some(texture) = waiting {
-                super::wait_for(texture, handle);
-            }
-            let later = !for_draw && (view.is_buffer() || waiting.is_some());
-            // Another view of the placed texture the slot shows already (a
-            // title that streams a texture in writes its view again with
-            // more mips each time some arrive): the slot goes on showing
-            // the old view until a draw or the texture pass makes the new
-            // one and uploads what it shows. Made null here, the texture
-            // read as nothing for as long as it waited in the queue, every
-            // time it got sharper.
-            if later
-                && keep_views()
-                && view_at(made[index as usize] as u32, (made[index as usize] >> 32) as u32)
-                    .is_some_and(|old| same_placed_texture(&old, &view))
-            {
-                KEPT_VIEWS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                return Some(view);
-            }
-            made[index as usize] = if later { 0 } else { key };
-            let kept = if later {
-                None
-            } else {
-                make(&view, self.cpu(index))
-            };
-            if kept.is_none() && !self.sampler {
-                null_for(&view, self.cpu(index));
-            }
-            self.keep(index, kept.flatten());
+        if made[index as usize].key == key {
+            // The same record past the `shown` epoch: `view_at` resolved
+            // it live just now, so what the slot shows is still it —
+            // refresh the epoch and hand the view out again. A `shown`
+            // the slot was made on stands: `kept` guards the resource.
+            let copy = made[index as usize]
+                .shown
+                .as_ref()
+                .and_then(|shown| shown.copy.clone())
+                .or_else(|| buffer_copy(&view));
+            let shown = std::sync::Arc::new(Shown {
+                key,
+                view,
+                copy,
+                epoch: super::views_epoch(),
+            });
+            made[index as usize].shown = Some(shown.clone());
+            return Some(shown);
         }
-        Some(view)
+        // Views of other textures in the memory this one describes
+        // are stale: their host slots read nothing from here on, and
+        // let go of the host copies they held.
+        for stale in self.note_buffer(index, Some(&view), for_draw) {
+            if stale != index {
+                self.unmake(made, stale);
+            }
+        }
+        // A view of a texture object that has no host copy yet waits
+        // for it, as buffer views wait for a draw: the slot is made
+        // when the texture is first used (`super::make_waiting`), or
+        // here when a draw reads the slot through a table.
+        let waiting = if for_draw { None } else { view.waiting_texture() };
+        if let Some(texture) = waiting {
+            super::wait_for(texture, handle);
+        }
+        let later = !for_draw && (view.is_buffer() || waiting.is_some());
+        // Another view of the placed texture the slot shows already (a
+        // title that streams a texture in writes its view again with
+        // more mips each time some arrive): the slot goes on showing
+        // the old view until a draw or the texture pass makes the new
+        // one and uploads what it shows. Made null here, the texture
+        // read as nothing for as long as it waited in the queue, every
+        // time it got sharper.
+        if later
+            && keep_views()
+            && view_at(
+                made[index as usize].key as u32,
+                (made[index as usize].key >> 32) as u32,
+            )
+            .is_some_and(|old| same_placed_texture(&old, &view))
+        {
+            KEPT_VIEWS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            return Some(std::sync::Arc::new(Shown {
+                key,
+                view,
+                copy: None,
+                epoch: super::views_epoch(),
+            }));
+        }
+        let kept = if later {
+            None
+        } else {
+            make(&view, self.cpu(index))
+        };
+        if kept.is_none() && !self.sampler {
+            null_for(&view, self.cpu(index));
+        }
+        // The copy the buffer view was made on, for `readable`: the
+        // shadow `make` gave the slot, not another a second look-up
+        // of the view's range would find.
+        let copy = kept
+            .as_ref()
+            .and_then(|kept| kept.copy.clone())
+            .and_then(|shadow| buffer_range(&view).map(|(a, l)| (shadow, a, l)));
+        let shown = std::sync::Arc::new(Shown {
+            key,
+            view,
+            copy,
+            epoch: super::views_epoch(),
+        });
+        made[index as usize] = Made {
+            key: if later { 0 } else { key },
+            shown: if later { None } else { Some(shown.clone()) },
+        };
+        self.keep(index, kept.and_then(|kept| kept.resource));
+        Some(shown)
     }
 
     /// Whether host slot `index` shows `buffer`; `None` if it shows no
@@ -1499,7 +1655,12 @@ impl HostHeap {
     /// a slot never made or left null.
     #[cfg(feature = "diagnostics")]
     pub(crate) fn describe_slot(&self, index: u32) -> Option<String> {
-        let key = *self.made.lock().unwrap_or_else(|e| e.into_inner()).get(index as usize)?;
+        let key = self
+            .made
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(index as usize)?
+            .key;
         if key == 0 {
             return Some("null".into());
         }
@@ -1663,8 +1824,14 @@ fn unordered_range(base: u64, words: &[u32; 10]) -> Option<(u64, u64)> {
     ))
 }
 
-/// The host resource a slot made by [`make`] views, if any.
-type Kept = Option<ID3D12Resource>;
+/// The host resource a slot made by [`make`] views, if any, and the
+/// host copy a buffer view was made on: the shadow `readable` refreshes
+/// and declares shader writes on, not another a second look-up of the
+/// view's range would find ([`buffer_copy`]).
+struct Kept {
+    resource: Option<ID3D12Resource>,
+    copy: Option<std::sync::Arc<crate::shadow::Shadow>>,
+}
 
 /// A structured buffer view (`first`, `count` elements of `stride` bytes,
 /// `offset` bytes into its host copy) as a raw view of the same bytes:
@@ -1788,7 +1955,10 @@ fn buffer_srv(
         host.device
             .CreateShaderResourceView(&shadow.buffer, Some(&desc), at)
     };
-    Some(Some(shadow.buffer.clone()))
+    Some(Kept {
+        resource: Some(shadow.buffer.clone()),
+        copy: Some(shadow),
+    })
 }
 
 /// An unordered access view of title buffer memory at `address` (`len`
@@ -1864,7 +2034,10 @@ fn buffer_uav(
         host.device
             .CreateUnorderedAccessView(&shadow.buffer, None::<&ID3D12Resource>, Some(&desc), at)
     };
-    Some(Some(shadow.buffer.clone()))
+    Some(Kept {
+        resource: Some(shadow.buffer.clone()),
+        copy: Some(shadow),
+    })
 }
 
 /// Whether the host can make a shader (or unordered access) view of
@@ -2020,7 +2193,10 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
             };
             // SAFETY: a slot of our heap; the range lies in the host copy.
             unsafe { device.CreateConstantBufferView(Some(&desc), at) };
-            Some(Some(shadow.buffer.clone()))
+            Some(Kept {
+                resource: Some(shadow.buffer.clone()),
+                copy: Some(shadow),
+            })
         }
         View::Shader(resource, desc) => {
             let resource = *resource as crate::object::This;
@@ -2061,7 +2237,10 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
                         at,
                     )
                 };
-                Some(Some(texture.clone()))
+                Some(Kept {
+                    resource: Some(texture.clone()),
+                    copy: None,
+                })
             } else if let (Some((data, len)), Some(desc)) =
                 (crate::resource::buffer_bytes(resource), desc)
             {
@@ -2123,7 +2302,10 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
                     at,
                 )
             };
-            Some(Some(texture.clone()))
+            Some(Kept {
+                resource: Some(texture.clone()),
+                copy: None,
+            })
         }
         View::Sampler(words) => {
             // SAFETY: 13 words in the host's layout.
@@ -2134,13 +2316,19 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
             };
             // SAFETY: a slot of our sampler heap.
             unsafe { device.CreateSampler(&desc, at) };
-            Some(None)
+            Some(Kept {
+                resource: None,
+                copy: None,
+            })
         }
         View::ConsoleSampler(words) => {
             let desc = crate::sampler::console(words);
             // SAFETY: a slot of our sampler heap.
             unsafe { device.CreateSampler(&desc, at) };
-            Some(None)
+            Some(Kept {
+                resource: None,
+                copy: None,
+            })
         }
         View::Placed(unordered, resource, desc) => {
             if let Some(view) = placed_texture(view) {

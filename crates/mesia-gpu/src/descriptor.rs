@@ -721,6 +721,18 @@ fn record(handle: u64, view: View) {
     mirror(handle);
 }
 
+/// Bumped by [`forget`] as table entries are freed: what a host heap
+/// resolved a record's view to (a `HostHeap`'s `shown`) is kept under
+/// the epoch it was resolved at, and re-checked against this, so a view
+/// freed meanwhile is not handed out as live. Release: a reader that
+/// sees the new epoch does the slow look-up, which sees the frees.
+static EPOCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// [`EPOCH`] now.
+pub(crate) fn views_epoch() -> u64 {
+    EPOCH.load(std::sync::atomic::Ordering::Acquire)
+}
+
 /// The title released `resource`: the views naming it go stale.
 pub(crate) fn forget(resource: usize) {
     #[cfg(windows)]
@@ -728,6 +740,7 @@ pub(crate) fn forget(resource: usize) {
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .remove(&resource);
+    EPOCH.fetch_add(1, std::sync::atomic::Ordering::Release);
     let mut views = VIEWS.lock().unwrap_or_else(|e| e.into_inner());
     let Some(entries) = views.by_resource.remove(&resource) else {
         return;
