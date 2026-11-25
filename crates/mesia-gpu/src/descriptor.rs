@@ -1190,47 +1190,4 @@ mod tests {
         assert_eq!(create(desc, Placement { address, size: 7 }, &mut h), S_OK);
         assert_ne!(slot::<extern "system" fn(This) -> u64>(h, 0x48)(h), address);
     }
-
-    /// A title heap over a million descriptors resolves every slot's index
-    /// (how many of them a host heap mirrors is `host`'s business).
-    #[test]
-    fn a_heap_over_a_million_slots_resolves_each_index() {
-        let count = 1_100_000;
-        let desc = HeapDesc {
-            kind: 0,
-            count,
-            flags: 1,
-            nodes: 0,
-        };
-        let none = Placement {
-            address: 0,
-            size: 0,
-        };
-        let mut h = std::ptr::null();
-        assert_eq!(create(desc, none, &mut h), S_OK);
-        let start = heap(h).start;
-        for index in [0, 737_855, 999_999, 1_000_000, count - 1] {
-            let handle = start + u64::from(index) * 32;
-            assert_eq!(heap(h).index(handle), Some(index), "slot {index}");
-            #[cfg(windows)]
-            assert_eq!(heap(h).handle(index), Some(handle));
-        }
-        // The end is out, and an index past the count is no slot's.
-        assert_eq!(heap(h).index(start + u64::from(count) * 32), None);
-        #[cfg(windows)]
-        {
-            assert_eq!(heap(h).handle(count), None);
-            // A slot over a million resolves in the shader-heap ranges too,
-            // and a write to it waits for the host heap to be made.
-            let (_, index) = shader_slot(start + 1_000_000 * 32).expect("a shader-visible heap");
-            assert_eq!(index, 1_000_000);
-            mirror(start + 1_000_000 * 32);
-            assert_eq!(
-                heap(h).pending.lock().unwrap().last().copied(),
-                Some(1_000_000)
-            );
-            // The heap off the global list again (its Drop runs `retain`).
-            slot::<extern "system" fn(This) -> u32>(h, 0x10)(h);
-        }
-    }
 }

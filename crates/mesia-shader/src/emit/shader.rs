@@ -112,8 +112,8 @@ pub(crate) struct Geometry {
     pub max_vertices: u32,
 }
 
-/// The null slot a host view heap keeps after its mirrored slots when the title's heap did not
-/// fit in it (0: no limit). Shaders translated while it is set read that slot for any view index
+/// The null slot a host view heap keeps at its end when the title's heap did not fit in it
+/// (0: no limit). Shaders translated while it is set read that slot for any view index
 /// at or past it: a host that caps its heap (NVIDIA at 1 000 000 views; a retail game's heap is
 /// larger) hung its GPU on reads past the end (GPU-based validation: "descriptor heap index
 /// out of bounds"), which AMD's driver forgives.

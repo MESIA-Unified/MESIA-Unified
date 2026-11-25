@@ -23,12 +23,6 @@ pub(crate) struct HostHeap {
     /// sampler heaps. (Upstream falls back to 2^16 on a capped host heap;
     /// ours keeps 2^18 there: 2^16 and 2^17 both ran out in this title.)
     dynamic: u32,
-    /// The first dynamic slot: the heap's last `dynamic` ones. A heap the
-    /// host capped keeps one slot between the mirrored and the dynamic
-    /// ones, never made: shaders' out-of-range view indices are clamped
-    /// onto it (`set_view_heap_limit`), so they can no more land on a
-    /// table's slot than read past the heap's end.
-    dyn_base: u32,
     sampler: bool,
     /// The record (view index and generation) each slot was last made from.
     made: Mutex<Vec<u64>>,
@@ -456,11 +450,6 @@ pub(crate) fn is_texture_view(view: &View) -> bool {
 /// ([`buffer_view_ok`]), since the start.
 pub(crate) static REFUSED_VIEWS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-/// Title heap slots written or made past the host heap's mirrored slots
-/// (a host that caps view heaps at [`PORTABLE_VIEWS`], NVIDIA), since the
-/// start. Their shaders get the heap's permanent null slot.
-pub(crate) static PAST_HEAP: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-
 /// Whether the host device is gone, and why (the first time it is asked
 /// after that): for passes that make many views, to name the one that did
 /// it.
@@ -544,10 +533,9 @@ const PORTABLE_VIEWS: u32 = 1_000_000;
 /// shaders translated at once) before it makes its view heap. Those would
 /// read a view index past the heap unclamped, the read that hangs NVIDIA.
 /// Called before a shader is translated.
-/// shortcut: the limit is the capped heap's permanent null slot
-/// ([`CAPPED_VIEWS`]) whatever size the title's heap turns out to have; a
-/// heap that fits is not capped and keeps no null slot there (an index
-/// past it is as undefined as before).
+/// shortcut: the limit is the capped heap's last slot whatever size the
+/// title's heap turns out to have; a heap that fits is not capped and
+/// keeps no null slot there (an index past it is as undefined as before).
 pub(crate) fn probe_view_limit() {
     static ONCE: std::sync::Once = std::sync::Once::new();
     ONCE.call_once(|| {
@@ -564,7 +552,7 @@ pub(crate) fn probe_view_limit() {
         };
         if made.is_err() {
             tracing::info!("the host caps view heaps at {PORTABLE_VIEWS}: view indices are clamped from the first shader on");
-            mesia_shader::emit::set_view_heap_limit(CAPPED_VIEWS);
+            mesia_shader::emit::set_view_heap_limit(PORTABLE_VIEWS - 1);
         }
     });
 }
@@ -581,17 +569,6 @@ pub(crate) fn probe_view_limit() {
 /// for it, and the card stopped within frames). 2^18 leaves 737,000; a
 /// table past them is made afresh in these slots like any other.
 pub(crate) const DYNAMIC: u32 = 1 << 18;
-
-/// Title slots mirrored when the host caps a view heap at
-/// [`PORTABLE_VIEWS`]: one more slot is kept null for shaders to clamp
-/// out-of-range view indices onto (`set_view_heap_limit`), and the
-/// [`DYNAMIC`] dynamic slots take the rest.
-const CAPPED_VIEWS: u32 = PORTABLE_VIEWS - DYNAMIC - 1;
-
-/// The most samplers a shader-visible heap may hold on any host (the
-/// host's own limit): translated shaders read its last slot for an index
-/// at or past it.
-const SAMPLER_MOST: u32 = 2048;
 
 impl HostHeap {
     pub(crate) fn new(sampler: bool, count: u32) -> Option<Self> {
@@ -614,26 +591,16 @@ impl HostHeap {
             }
         };
         let extra = if sampler { 0 } else { DYNAMIC };
-        let total = count.saturating_add(extra);
-        let (heap, count, size) = match make(total) {
-            Ok(heap) => (heap, count, total),
-            Err(e) if !sampler && total > PORTABLE_VIEWS => {
-                // shortcut: descriptors past the host's limit are left out; a title that
-                // reaches them needs remapping (a second host heap, and shaders that pick
-                // it by index range, are outside this module). The slot that ends the
-                // mirrored ones is never made: shaders read it for any view index at or
-                // past it (`set_view_heap_limit`), not the dynamic slots after it, whose
-                // tables are another draw's; a read past the heap's end hung NVIDIA's GPU
-                // (the title's heap is a little over 1 000 000 views).
-                tracing::warn!(error = %e, count, "host view heap capped at {PORTABLE_VIEWS}; views past {CAPPED_VIEWS} read a null slot");
-                mesia_shader::emit::set_view_heap_limit(CAPPED_VIEWS);
-                (make(PORTABLE_VIEWS).ok()?, CAPPED_VIEWS, PORTABLE_VIEWS)
-            }
-            Err(e) if sampler && count > SAMPLER_MOST => {
-                // The largest sampler heap there is, its slots all mirrored:
-                // translated shaders read its last slot for an index past it.
-                tracing::warn!(error = %e, count, "host sampler heap capped at {SAMPLER_MOST}");
-                (make(SAMPLER_MOST).ok()?, SAMPLER_MOST, SAMPLER_MOST)
+        let (heap, count, size) = match make(count + extra) {
+            Ok(heap) => (heap, count, count + extra),
+            Err(e) if !sampler && count + extra > PORTABLE_VIEWS => {
+                // shortcut: descriptors past the host's limit are left out; a title that reaches
+                // them needs remapping. The heap's last slot stays null, and shaders read it for
+                // any view index from there on (`set_view_heap_limit`): a read past the heap's
+                // end hung NVIDIA's GPU (the title's heap is a little over 1 000 000 views).
+                tracing::warn!(error = %e, count, "host view heap capped at {PORTABLE_VIEWS}; views past it read a null slot");
+                mesia_shader::emit::set_view_heap_limit(PORTABLE_VIEWS - 1);
+                (make(PORTABLE_VIEWS).ok()?, PORTABLE_VIEWS - extra - 1, PORTABLE_VIEWS)
             }
             Err(e) => {
                 tracing::warn!(error = %e, count, sampler, "no host descriptor heap");
@@ -652,7 +619,7 @@ impl HostHeap {
         let gpu = unsafe { heap.GetGPUDescriptorHandleForHeapStart().ptr };
         GPU_RANGES.lock().unwrap_or_else(|e| e.into_inner()).push((
             gpu,
-            u64::from(size) * u64::from(step),
+            u64::from(count + extra) * u64::from(step),
             u64::from(step),
             sampler,
         ));
@@ -675,14 +642,11 @@ impl HostHeap {
             step,
             count,
             dynamic: extra,
-            // The heap's last `extra` slots (a capped heap keeps one slot
-            // before them null for the clamp).
-            dyn_base: size - extra,
             sampler,
             made: Mutex::new(vec![0; count as usize]),
-            kept: Mutex::new(vec![None; size as usize]),
-            next: Mutex::new((0, vec![false; extra as usize])),
-            free: std::sync::atomic::AtomicU32::new(extra),
+            kept: Mutex::new(vec![None; (count + extra) as usize]),
+            next: Mutex::new((0, vec![false; DYNAMIC as usize])),
+            free: std::sync::atomic::AtomicU32::new(DYNAMIC),
             too_long: std::sync::atomic::AtomicU32::new(u32::MAX),
             strides,
             buffers: Mutex::default(),
@@ -818,7 +782,7 @@ impl HostHeap {
         taken[first..first + n].fill(true);
         self.free.fetch_sub(n as u32, std::sync::atomic::Ordering::Relaxed);
         *next = ((first + n) % DYNAMIC as usize) as u32;
-        Some(self.dyn_base + first as u32)
+        Some(self.count + first as u32)
     }
 
     /// The title slots this heap has host slots for; fewer than the title's
@@ -1117,7 +1081,7 @@ impl HostHeap {
     ///
     /// [`dynamic`]: HostHeap::dynamic
     pub(crate) fn release(&self, first: u32, n: u32) {
-        let Some(at) = first.checked_sub(self.dyn_base) else {
+        let Some(at) = first.checked_sub(self.count) else {
             return;
         };
         let mut guard = self.next.lock().unwrap_or_else(|e| e.into_inner());
@@ -1293,18 +1257,15 @@ impl HostHeap {
     /// data: a host copy of a buffer is made on first use.
     pub(crate) fn mirror(&self, index: u32, handle: u64, for_draw: bool) -> Option<View> {
         if index >= self.count {
-            // Diagnostic (NVIDIA heap cap): every write of a title slot the
-            // host heap has no slot for is counted; the highest 64K band of
-            // them is warned of (a heap can see hundreds of thousands).
-            PAST_HEAP.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            // Diagnostic (NVIDIA heap cap): the highest title slot past the
+            // host heap seen so far.
             static HIGHEST: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-            let prev = HIGHEST.fetch_max(index, std::sync::atomic::Ordering::Relaxed);
-            if index > prev && (prev == 0 || prev >> 16 != index >> 16) {
+            if HIGHEST.fetch_max(index, std::sync::atomic::Ordering::Relaxed) < index {
                 tracing::warn!(
                     index,
                     count = self.count,
                     for_draw,
-                    "title slot past the host heap reads its null slot"
+                    "title slot past the host heap"
                 );
             }
             return None;
@@ -2525,46 +2486,5 @@ mod tests {
         heap.release(a, 50);
         assert_eq!(heap.dynamic(50), Some(4));
         assert_eq!(heap.dynamic(40), Some(4 + heap.dynamic - 40));
-    }
-
-    /// A capped heap's layout: mirrored slots, one permanent null slot
-    /// shaders clamp out-of-range view indices onto, then the dynamic
-    /// slots — the whole portable heap, and the clamp below all of them.
-    #[test]
-    fn the_capped_layout_keeps_one_null_slot_below_the_dynamic_ones() {
-        assert_eq!(CAPPED_VIEWS + 1 + DYNAMIC, PORTABLE_VIEWS);
-        assert_eq!(CAPPED_VIEWS + 1, PORTABLE_VIEWS - DYNAMIC);
-    }
-
-    /// A host heap capped under the title's keeps one slot between the
-    /// mirrored and the dynamic ones, never made or handed out: the title
-    /// slots past it get no host slot, and shaders clamped onto it read
-    /// null instead of a table's slot.
-    #[test]
-    fn a_capped_heap_keeps_a_null_slot_before_its_dynamic_slots() {
-        let Some(heap) = HostHeap::new(false, CAPPED_VIEWS + 4096) else {
-            return; // no host GPU
-        };
-        if heap.count != CAPPED_VIEWS {
-            // A host that took the whole heap (tier 3): not capped.
-            assert_eq!(heap.count, CAPPED_VIEWS + 4096);
-            return;
-        }
-        // Mirrored slots, then the null slot, then dynamic slots to the
-        // heap's end.
-        assert_eq!(heap.dyn_base, heap.count + 1);
-        assert_eq!(heap.dyn_base + heap.dynamic, PORTABLE_VIEWS);
-        assert_eq!(heap.made.lock().unwrap().len(), heap.count as usize);
-        assert_eq!(heap.kept.lock().unwrap().len(), PORTABLE_VIEWS as usize);
-        // Dynamic slots are handed out past the null slot, never on it.
-        let first = heap.dynamic(16).unwrap();
-        assert!(first >= heap.dyn_base);
-        heap.release(first, 16);
-        // A title slot at or past the clamp has no host slot of its own.
-        let slot = [0u64; 4];
-        let at = slot.as_ptr() as u64;
-        assert_eq!(heap.mirror(heap.count, at, false), None);
-        assert_eq!(heap.mirror(heap.count + 4095, at, false), None);
-        assert!(PAST_HEAP.load(std::sync::atomic::Ordering::Relaxed) >= 2);
     }
 }
