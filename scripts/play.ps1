@@ -23,7 +23,7 @@ $env:MESIA_CARD_BUFFERS_MIN_MB = "1"
 $env:MESIA_CARD_BUFFERS_MB = "3072"
 $env:MESIA_CARD_WINDOWS_MB = "2048"
 $env:MESIA_UNWATCHED_FRAMES = "1"
-$env:MESIA_INPLACE = "2"                  # title buffers in place too; requires LATE_WAIT=0
+$env:MESIA_INPLACE = "1"                  # windows in place; stage 2 measured slower in-world (bus reads)
 $env:MESIA_WINDOW_KB = "1024"             # 1MiB windows for what cannot be placed (halves grid waste)
 $env:MESIA_TEXTURE_NO_WAIT = "1"
 $env:MESIA_JOIN_COPIES = "1"
