@@ -355,8 +355,14 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
     }
     j.asked += 1;
     let now = j.asked;
-    let pages = j.found[..count].iter().map(|&at| at / PAGE).chain(guarded);
-    for page in pages.collect::<Vec<_>>() {
+    // `found` is read while `written` is inserted into: by index, so the
+    // two fields' borrows never overlap (a collected temporary vector was
+    // an allocation for every asking).
+    for k in 0..count {
+        let page = j.found[k] / PAGE;
+        j.written.insert(page, now);
+    }
+    for page in guarded {
         j.written.insert(page, now);
     }
     Some((
@@ -560,19 +566,20 @@ fn uncommitted_end(block: usize) -> usize {
 /// notes them written; true if any was guarded.
 fn open(g: &mut Guards, start: usize, end: usize) -> bool {
     use windows_sys::Win32::System::Memory::{PAGE_READWRITE, VirtualProtect};
-    let blocks: Vec<usize> = g
-        .protected
-        .range(start / BLOCK..end.div_ceil(BLOCK))
-        .copied()
-        .collect();
-    for &block in &blocks {
+    let range = start / BLOCK..end.div_ceil(BLOCK);
+    // The lowest guarded block in the range, opened, then the next: the
+    // set cannot be iterated while it changes, and a collected list of the
+    // blocks was an allocation for every write.
+    let mut any = false;
+    while let Some(&block) = g.protected.range(range.clone()).next() {
         g.protected.remove(&block);
         g.clean.remove(&block);
         let mut old = 0;
         // SAFETY: a block we made read-only.
         unsafe { VirtualProtect((block * BLOCK) as *const _, BLOCK, PAGE_READWRITE, &mut old) };
+        any = true;
     }
-    !blocks.is_empty()
+    any
 }
 
 /// Before our own write into title memory `[at, at + len)` through the
@@ -654,20 +661,18 @@ pub fn title_memory_remapped(at: usize, len: usize) {
         let pages = at.div_ceil(PAGE)..at.saturating_add(len) / PAGE;
         if !pages.is_empty() {
             let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
-            let gone: Vec<usize> = j.written.range(pages).map(|(&page, _)| page).collect();
-            for page in gone {
+            while let Some((&page, _)) = j.written.range(pages.clone()).next() {
                 j.written.remove(&page);
             }
         }
     }
     let mut g = guards();
     let range = at / BLOCK..at.saturating_add(len).div_ceil(BLOCK);
-    let absent: Vec<usize> = g.absent.range(range.clone()).copied().collect();
-    for block in absent {
+    // The lowest entry in the range, removed, then the next, as in `open`.
+    while let Some(&block) = g.absent.range(range.clone()).next() {
         g.absent.remove(&block);
     }
-    let blocks: Vec<usize> = g.protected.range(range).copied().collect();
-    for block in blocks {
+    while let Some(&block) = g.protected.range(range.clone()).next() {
         g.protected.remove(&block);
         g.clean.remove(&block);
     }
