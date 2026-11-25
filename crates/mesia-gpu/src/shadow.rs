@@ -1324,18 +1324,30 @@ pub(crate) fn merge_groups(spans: &[(usize, usize, usize)]) -> Vec<Vec<usize>> {
     // end passes its start and every one after — and they stay open as the
     // merged interval, which the member that reaches farthest stands for.
     let mut order: Vec<usize> = (0..spans.len()).collect();
-    order.sort_unstable_by_key(|&i| spans[i].1);
-    let mut open: Vec<(usize, usize)> = Vec::new(); // (end, index)
+    order.sort_unstable_by_key(|&i| (spans[i].1, spans[i].2));
+    let mut open: Vec<(usize, usize, usize)> = Vec::new(); // (end, first start, index)
     for &i in &order {
         let (_, a, b) = spans[i];
-        let first = open.partition_point(|&(e, _)| e <= a);
-        let mut end = b;
+        if a == b {
+            // An empty range covers nothing: it joins only a merged
+            // interval that holds it strictly (some member covers it).
+            if let Some(&(e, s, j)) = open.get(open.partition_point(|&(e, _, _)| e <= a))
+                && e > a
+                && s < a
+            {
+                union(&mut root, j, i);
+            }
+            continue;
+        }
+        let first = open.partition_point(|&(e, _, _)| e <= a);
+        let (mut end, mut start) = (b, a);
         for k in first..open.len() {
-            union(&mut root, open[k].1, i);
+            union(&mut root, open[k].2, i);
             end = end.max(open[k].0);
+            start = start.min(open[k].1);
         }
         open.truncate(first);
-        open.push((end, i));
+        open.push((end, start, i));
     }
     let mut groups: Vec<(usize, Vec<usize>)> = Vec::new();
     let mut place: std::collections::HashMap<usize, usize> = std::collections::HashMap::new();
@@ -1696,6 +1708,274 @@ mod wide_tests {
             one_by_one.as_secs_f64() / on_the_threads.as_secs_f64(),
             written_seq.iter().sum::<usize>() >> 20,
         );
+    }
+
+    /// The O(n²) grouping [`merge_groups`] replaced, kept as its
+    /// reference: for each pair of items, one copy or title ranges that
+    /// overlap join them — `[a, b)` and `[c, d)` meet only when
+    /// `a < d && c < b`, so ends that just touch stay apart. What joins
+    /// transitively is one group, its items in the order given.
+    ///
+    /// With `loose`, an empty range `[x, x)` also joins a range whose
+    /// `[c, d)` holds `c <= x < d` — the point inside it, its start
+    /// included: what the sweep's open intervals answer for an empty
+    /// span, where the strict check's ends only touch.
+    fn naive_merge_groups(spans: &[(usize, usize, usize)], loose: bool) -> Vec<Vec<usize>> {
+        let mut root: Vec<usize> = (0..spans.len()).collect();
+        fn root_of(root: &mut [usize], mut i: usize) -> usize {
+            while root[i] != i {
+                i = root[i];
+            }
+            i
+        }
+        for i in 0..spans.len() {
+            for j in i + 1..spans.len() {
+                let ((p, a, b), (q, c, d)) = (spans[i], spans[j]);
+                if p == q
+                    || (a < d && c < b)
+                    || (loose && ((a == b && c <= a && a < d) || (c == d && a <= c && c < b)))
+                {
+                    let (x, y) = (root_of(&mut root, i), root_of(&mut root, j));
+                    root[x.max(y)] = x.min(y);
+                }
+            }
+        }
+        let mut place = std::collections::HashMap::new();
+        let mut groups: Vec<Vec<usize>> = Vec::new();
+        for i in 0..spans.len() {
+            let k = *place.entry(root_of(&mut root, i)).or_insert_with(|| groups.len());
+            if k == groups.len() {
+                groups.push(Vec::new());
+            }
+            groups[k].push(i);
+        }
+        groups
+    }
+
+    /// A deterministic generator (a splitmix-style step — no `rand` in
+    /// dev-deps, the same sets every run).
+    struct Lcg(u64);
+    impl Lcg {
+        fn next(&mut self) -> u64 {
+            self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            self.0 >> 33
+        }
+        fn below(&mut self, n: u64) -> u64 {
+            self.next() % n
+        }
+    }
+
+    /// No empty range sits on another range's start — the one corner
+    /// where an open interval's coverage answers more than the strict
+    /// pairwise check (see [`merge_groups_empty_on_anothers_start`]).
+    /// Everywhere else the two provably give the same partition.
+    fn start_clear(spans: &[(usize, usize, usize)]) -> bool {
+        spans.iter().enumerate().all(|(i, &(_, a, b))| {
+            a < b || !spans.iter().enumerate().any(|(j, &(_, c, d))| i != j && c == a && c < d)
+        })
+    }
+
+    /// `got` must be a partition of `0..spans.len()` — each index once,
+    /// each group in the order given — between the strict and the loose
+    /// pairwise union: every pair the strict check joins stays in one
+    /// group (the safety half — two jobs never write the same byte),
+    /// and nothing joins that even the loose reading keeps apart. On a
+    /// `start_clear` set the two readings meet, so the partition must
+    /// be exactly the pairwise union's. Returns `got`.
+    fn check_merge_groups(spans: &[(usize, usize, usize)]) -> Vec<Vec<usize>> {
+        let got = merge_groups(spans);
+        let mut group_of = vec![usize::MAX; spans.len()];
+        for (g, group) in got.iter().enumerate() {
+            assert!(group.windows(2).all(|w| w[0] < w[1]), "group's items not in the order given: {group:?}");
+            for &i in group {
+                assert!(group_of[i] == usize::MAX, "item {i} in two groups of {got:?}");
+                group_of[i] = g;
+            }
+        }
+        assert!(group_of.iter().all(|&g| g != usize::MAX), "items missing from {got:?}");
+        let strict = naive_merge_groups(spans, false);
+        for group in &strict {
+            assert!(
+                group.iter().all(|&i| group_of[i] == group_of[group[0]]),
+                "a group the pairwise union joins is split: {group:?} -> {got:?} for {spans:?}"
+            );
+        }
+        if start_clear(spans) {
+            let (mut got_sorted, mut want) = (got.clone(), strict);
+            got_sorted.sort_unstable();
+            want.sort_unstable();
+            assert_eq!(got_sorted, want, "partition differs from the pairwise union's for {spans:?}");
+        }
+        let loose = naive_merge_groups(spans, true);
+        let mut loose_of = vec![usize::MAX; spans.len()];
+        for (g, group) in loose.iter().enumerate() {
+            for &i in group {
+                loose_of[i] = g;
+            }
+        }
+        for group in &got {
+            assert!(
+                group.iter().all(|&i| loose_of[i] == loose_of[group[0]]),
+                "joined past even the loose reading: {group:?} for {spans:?}"
+            );
+        }
+        got
+    }
+
+    /// The sweep over disjoint open intervals gives the same groups as
+    /// the pairwise union — on edges made by hand (empty ranges, one
+    /// copy's repeats, chains that bridge copies, ends that touch,
+    /// ranges in ranges) and on generated sets of every size.
+    #[test]
+    fn merge_groups_groups_like_the_pairwise_union() {
+        for spans in [
+            vec![],
+            vec![(1, 0, 0)],
+            vec![(1, 4, 4), (2, 0, 10)],                // empty strictly inside another's
+            vec![(1, 0, 10), (2, 10, 10)],              // empty at a range's end
+            vec![(1, 5, 5), (2, 5, 5)],                 // two copies' one empty point
+            vec![(9, 6, 6), (9, 0, 10), (2, 6, 6), (9, 4, 4)], // one copy's empties
+            vec![(1, 0, 10), (2, 10, 20), (3, 20, 30)], // touching ends stay apart
+            vec![(1, 0, 4), (2, 3, 8), (3, 7, 12), (4, 11, 15), (5, 14, 18)], // a chain of overlaps
+            vec![(7, 2, 9), (7, 0, 1), (3, 8, 12), (7, 20, 30), (3, 21, 29)], // a copy's, and a bridge
+            vec![(1, 0, 100), (2, 10, 20), (3, 30, 40), (4, 20, 30), (5, 90, 110)], // held in, touching
+        ] {
+            check_merge_groups(&spans);
+        }
+        let mut rng = Lcg(0x9e37_79b9_7f4a_7c15);
+        for n in [0usize, 1, 2, 7, 64, 512, 2000] {
+            // (copies, space, longest range, one empty in k): small
+            // spaces chain and nest the ranges, big ones keep them
+            // apart, and the small ones make ends meet exactly.
+            for &(copies, space, longest, empty) in &[
+                (3u64, 40, 12, 0),
+                (7, 400, 400, 6),
+                (1, 1 << 20, 1 << 16, 0),
+                (64, 128, 100, 4),
+                (2000, 64, 8, 3),
+                (64, 1 << 20, 1 << 12, 8),
+            ] {
+                for _ in 0..8 {
+                    let spans: Vec<(usize, usize, usize)> = (0..n)
+                        .map(|_| {
+                            let a = rng.below(space) as usize;
+                            let b = if empty != 0 && rng.below(empty) == 0 {
+                                a
+                            } else {
+                                a + 1 + rng.below(longest) as usize
+                            };
+                            (rng.below(copies) as usize, a, b)
+                        })
+                        .collect();
+                    check_merge_groups(&spans);
+                }
+            }
+            // A deterministic shape the rounds may miss: `n` ranges of
+            // `n` copies in a chain where each touches only the next's
+            // start — nothing may merge — and the same chain shifted to
+            // overlap by one — all must merge.
+            let apart: Vec<(usize, usize, usize)> = (0..n).map(|i| (i + 1, i * 4, i * 4 + 4)).collect();
+            check_merge_groups(&apart);
+            let linked: Vec<(usize, usize, usize)> = (0..n).map(|i| (i + 1, i * 4, i * 4 + 5)).collect();
+            let groups = check_merge_groups(&linked);
+            assert_eq!(groups.len(), usize::from(n > 0), "the overlapping chain must be one group");
+        }
+    }
+
+    /// The one corner where the sweep and the strict pairwise union
+    /// part: an empty `[x, x)` on another range's start — the pairwise
+    /// check's ends only touch, while the open coverage holds the point
+    /// when a range `[x, e)` still reaches past it. Whether it joins
+    /// then turns on how the equal starts happen to sort, so a set and
+    /// its permutations may not give the same partition — pinned here
+    /// as bounded by the strict and loose readings, never less than one
+    /// or more than the other. An empty range merges no bytes, so two
+    /// jobs' writes cannot mix either way.
+    #[test]
+    fn merge_groups_empty_on_anothers_start() {
+        // `[5, 5)` may or may not join `[5, 10)`, but never `[0, 5)` —
+        // the two outcomes the equal-start order allows.
+        for spans in [
+            vec![(1, 0, 5), (2, 5, 10), (3, 5, 5)],
+            vec![(3, 5, 5), (1, 0, 5), (2, 5, 10)],
+            vec![(2, 5, 10), (3, 5, 5), (1, 0, 5)],
+            vec![(1, 4, 4), (2, 4, 10)],
+            vec![(2, 4, 10), (1, 4, 4)],
+            vec![(1, 4, 4), (2, 4, 10), (3, 4, 8)],
+        ] {
+            let got = check_merge_groups(&spans);
+            let strict = naive_merge_groups(&spans, false);
+            let loose = naive_merge_groups(&spans, true);
+            assert!(strict.len() >= got.len() && got.len() >= loose.len(), "{got:?} outside the two readings for {spans:?}");
+        }
+        // One empty on a start, then its copy's other items: the copy's
+        // union and the strict overlap stand whatever the empty does.
+        let spans = [(9, 3, 3), (7, 3, 9), (9, 20, 30), (4, 25, 26)];
+        let got = check_merge_groups(&spans);
+        let group_of = |i: usize| got.iter().position(|g| g.contains(&i)).unwrap();
+        assert!(group_of(0) == group_of(2) && group_of(2) == group_of(3), "{got:?}");
+    }
+
+    /// Grouping a heavy frame's pieces: ~2000 spans of ~70 copies whose
+    /// declared ranges are ~8k pieces' — several pieces share a
+    /// (copy, range) tuple, and a few windows sit inside a host copy's
+    /// range so the groups cross copies, as `card_back` hands them over.
+    /// `cargo test --release -p mesia-gpu -- --ignored --nocapture scales`.
+    #[test]
+    #[ignore = "benchmark"]
+    fn merge_groups_scales() {
+        const COPIES: usize = 70;
+        const WINDOWS: usize = 8;
+        const PIECES_PER_RANGE: usize = 4;
+        const SPANS: usize = 2000;
+        const PITCH: usize = 9 << 20;
+        const LEN: usize = 8 << 20;
+        let mut rng = Lcg(0xface_5eed_c0ff_ee00);
+        let mut spans = Vec::with_capacity(SPANS + WINDOWS * PIECES_PER_RANGE);
+        // ~2000 spans: each copy's declared ranges (~4) cut into pieces
+        // that share one (copy, from, to) tuple, inside the copy's band
+        // of title memory and reaching into a neighbour's.
+        while spans.len() < SPANS {
+            let c = rng.below(COPIES as u64) as usize;
+            let from = rng.below((LEN - (1 << 20)) as u64) as usize;
+            let to = from + 1 + rng.below(2 << 20) as usize;
+            for _ in 0..PIECES_PER_RANGE {
+                spans.push((c, c * PITCH + from, (c * PITCH + to).min((c + 1) * PITCH + (256 << 10))));
+            }
+        }
+        // Window copies inside a host's declared range: their ranges
+        // overlap the host's pieces', which must land them together.
+        for w in 0..WINDOWS {
+            let host = w * (COPIES / WINDOWS);
+            let from = LEN / 2 + w * (PIECE + 1);
+            for _ in 0..PIECES_PER_RANGE {
+                spans.push((COPIES + w, host * PITCH + from, host * PITCH + from + (WIDE_JOB + 3)));
+            }
+        }
+        // The quadratic reference still verifies the ~2000-span
+        // partition; then the timed calls run alone.
+        let groups = check_merge_groups(&spans);
+        let n_groups = groups.len();
+        // The partition still holds every index once, in order.
+        assert_eq!(groups.iter().map(Vec::len).sum::<usize>(), spans.len());
+        for g in &groups {
+            assert!(g.windows(2).all(|w| w[0] < w[1]));
+        }
+        const RUNS: usize = 200;
+        let clock = std::time::Instant::now();
+        let mut sinks = 0usize;
+        for _ in 0..RUNS {
+            let groups = merge_groups(std::hint::black_box(&spans));
+            sinks += std::hint::black_box(groups.len());
+        }
+        let took = clock.elapsed();
+        println!(
+            "merge_groups: {} spans ({} copies) -> {n_groups} groups: {:.3} ms a call ({RUNS} calls, {took:?})",
+            spans.len(),
+            COPIES + WINDOWS,
+            took.as_secs_f64() * 1e3 / RUNS as f64,
+        );
+        assert_eq!(sinks, n_groups * RUNS);
     }
 }
 
