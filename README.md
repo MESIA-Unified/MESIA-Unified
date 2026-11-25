@@ -8,7 +8,8 @@ of the game. Not affiliated with or endorsed by its developer or publisher.
 
 ## Status (2026-11-25)
 
-Tested on Windows 11 with an **NVIDIA GeForce RTX 3050** (8 GB):
+Tested on Windows 11 with an **NVIDIA GeForce RTX 3060** (12 GB) and 16 GB of RAM.
+Detailed progress notes and current blockers: **[STATUS.md](STATUS.md)**
 
 | | |
 |---|---|
