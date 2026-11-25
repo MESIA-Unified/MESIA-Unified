@@ -1,5 +1,7 @@
 # mesia
 
+**English** | [Français](README_FR.md)
+
 **mesia** runs the Xbox Series build of the game natively on Windows PCs with
 NVIDIA graphics cards, from game files you supply yourself.
 

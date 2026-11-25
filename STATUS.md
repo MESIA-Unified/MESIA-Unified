@@ -1,5 +1,7 @@
 # MESIA — Status & Roadmap
 
+**English** | [Français](STATUS_FR.md)
+
 _Last updated: 2026-11-25. Test machine: Windows 11, NVIDIA GeForce RTX 3060 12 GB (driver current), 16 GB RAM._
 
 MESIA runs the Xbox Series build of the game natively on Windows: the
