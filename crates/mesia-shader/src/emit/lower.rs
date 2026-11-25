@@ -295,6 +295,10 @@ struct Lower<'a> {
     counters: HashMap<usize, (V, Vec<(V, usize)>)>,
     /// The block a loop stopped by [`LOOP_LIMIT`] leaves the program from.
     abort: Option<usize>,
+    /// (DXIL block, loop header, IR block) of each exit a stopped lane
+    /// takes by the loop's own way out instead of `abort` ([`Self::limit_exit`]):
+    /// [`Self::fill_phis`] gives the IR block's phis an incoming for it.
+    abort_edges: Vec<(usize, usize, usize)>,
 }
 
 /// Iterations after which a loop is left (per entry into it), unless
@@ -1552,6 +1556,7 @@ impl<'a> Lower<'a> {
             code_table: None,
             counters: HashMap::new(),
             abort: None,
+            abort_edges: Vec::new(),
         }
     }
 
@@ -10633,7 +10638,7 @@ impl<'a> Lower<'a> {
         let term = match self.x.st.exits[b] {
             LaneExit::Jump(t) if self.counters.contains_key(&t) && self.rpo[t] <= self.rpo[b] => {
                 let ok = self.count_iteration(t, pred::IULT);
-                let abort = self.abort_block();
+                let abort = self.limit_exit(t, b);
                 Term::CondBr(ok, self.block[t].expect("reachable"), abort)
             }
             LaneExit::Jump(t) => {
@@ -10773,6 +10778,71 @@ impl<'a> Lower<'a> {
         a
     }
 
+    /// The DXIL block a lane [`LOOP_LIMIT`] cuts out of the `t`-headed loop
+    /// takes: the loop's own exit — the header's successor outside the loop —
+    /// so the lane still meets every group barrier past it (a lane `Ret`-ing
+    /// at the latch `b` would not, and the group would wait on it forever).
+    /// Where the exit is not clear — the header does not branch, both or
+    /// neither successor is inside, it is `t` itself, or `out` hosts a
+    /// descriptor join the new edge could not feed — the lane leaves the
+    /// program by [`Self::abort_block`] as before.
+    fn limit_exit(&mut self, t: usize, b: usize) -> usize {
+        let LaneExit::Branch {
+            taken, not_taken, ..
+        } = self.x.st.exits[t]
+        else {
+            return self.abort_block();
+        };
+        // The successor still inside reaches the latch `b` before the back
+        // edge (`rpo[t] < rpo[s] <= rpo[b]`); the other is the exit.
+        let in_loop = |s: usize| self.rpo[t] < self.rpo[s] && self.rpo[s] <= self.rpo[b];
+        let out = match (in_loop(taken), in_loop(not_taken)) {
+            (false, true) => taken,
+            (true, false) => not_taken,
+            _ => return self.abort_block(),
+        };
+        // A lane branching to its own header stays in the loop: that is no
+        // exit at all (the count would start over and never end).
+        if out == t || self.block[out].is_none() || self.descriptor_join(out) {
+            return self.abort_block();
+        }
+        let ab = self.s.m.new_block();
+        self.s.m
+            .terminate(ab, Term::Br(self.block[out].expect("reachable")));
+        self.abort_edges.push((ab, t, out));
+        // If `out` heads a loop itself, a lane entering it here starts the
+        // count at 0.
+        self.enter_loop(b, out, ab);
+        ab
+    }
+
+    /// Whether a tracked descriptor joins its value per edge at IR block
+    /// `b` (a `Source::Phi` or `Source::LanePhi`): the join is a phi at
+    /// `b`'s DXIL block made when a use reads it, so an edge
+    /// [`Self::limit_exit`] adds to `b` would leave that phi an incoming
+    /// short.
+    fn descriptor_join(&self, b: usize) -> bool {
+        fn joins_at(src: &Source, b: usize) -> bool {
+            match src {
+                Source::Phi { block, args } => {
+                    *block == b || args.iter().any(|s| joins_at(s, b))
+                }
+                Source::LanePhi { block, args } => {
+                    *block == b || args.iter().flatten().any(|s| joins_at(s, b))
+                }
+                Source::Select { args, .. } | Source::Lanes { args, .. } => {
+                    args.iter().any(|s| joins_at(s, b))
+                }
+                _ => false,
+            }
+        }
+        self.x
+            .res
+            .descriptors
+            .iter()
+            .any(|d| joins_at(&d.source, b))
+    }
+
     /// The DXIL block a branch from IR block `from` to `to` goes to.
     fn edge(&mut self, from: usize, to: usize) -> usize {
         let target = self.block[to].expect("reachable");
@@ -10797,6 +10867,9 @@ impl<'a> Lower<'a> {
         // of masks and of numbers): each edge's mask as the structure
         // tracked it, a constant or a scalar-built one included.
         let st = self.x.st;
+        // Edges lanes a limit cut out of loops take (`Self::limit_exit`):
+        // each of the target's phis gets an extra incoming for them.
+        let abort_edges = self.abort_edges.clone();
         while let Some((v, b, i)) = self.pending_masks.pop() {
             let phi = &p.blocks[b].phis[i];
             let offset = p.blocks[b].offset;
@@ -10810,6 +10883,21 @@ impl<'a> Lower<'a> {
                 let qb = self.edges.get(&(q, b)).copied().unwrap_or(qb);
                 let x = self.boolean(args[n], qb).map_err(|w| unsupported(offset, w))?;
                 incoming.push((x, qb));
+            }
+            // A lane the limit cut out of the `t`-headed loop reaches `b`
+            // through `ab` as the loop's own exit does: its edge brings the
+            // mask the header's `t`-edge brings, built in `ab`.
+            for &(ab, t, out) in &abort_edges {
+                if out != b {
+                    continue;
+                }
+                let Some(n) = p.blocks[b].preds.iter().position(|&q| q == t) else {
+                    continue;
+                };
+                let x = self
+                    .boolean(args[n], ab)
+                    .map_err(|w| unsupported(offset, w))?;
+                incoming.push((x, ab));
             }
             self.s.m.set_phi(v, incoming);
         }
@@ -10854,6 +10942,9 @@ impl<'a> Lower<'a> {
                     .iter()
                     .any(|a| matches!(self.vals.get(a), Some(Val::I32(_))));
             let mut incoming = Vec::new();
+            // What each predecessor's edge brings (first occurrence: an
+            // `abort` edge for it brings the same).
+            let mut first = HashMap::new();
             for (n, &q) in p.blocks[b].preds.iter().enumerate() {
                 let Some(qb) = self.tail[q] else { continue };
                 let qb = self.edges.get(&(q, b)).copied().unwrap_or(qb);
@@ -10928,6 +11019,18 @@ impl<'a> Lower<'a> {
                     _ => self.s.m.i32(0),
                 };
                 incoming.push((x, qb));
+                first.entry(q).or_insert(x);
+            }
+            // A lane the limit cut out of the `t`-headed loop reaches `b`
+            // through `ab` as the loop's own exit does, bringing what the
+            // header's `t`-edge brings.
+            for &(ab, t, out) in &abort_edges {
+                if out != b {
+                    continue;
+                }
+                if let Some(&x) = first.get(&t) {
+                    incoming.push((x, ab));
+                }
             }
             self.s.m.set_phi(v, incoming);
         }
@@ -11644,5 +11747,26 @@ mod tests {
         assert!(f10(0x3FF).is_nan());
         // A 16-bit float is a half already, sign included.
         assert_eq!(half(0xBC00 << half_shift(16)), -1.0);
+    }
+
+    /// A `Jump`-latch loop — the latch's `s_branch` back to the header — a
+    /// lane the iteration limit cuts out of leaves by the header's own exit,
+    /// so a group barrier past the loop still meets it. `out` joins the
+    /// header's exit edge and `side`, so its phis take the limit edge's
+    /// incoming too.
+    #[test]
+    fn a_limited_jump_latch_leaves_by_the_loops_exit() {
+        let words = [
+            0xBF07_8000, // entry: s_cmp_lg_u32 s0, 0
+            0xBF84_0004, // s_cbranch_scc0 -> side
+            0x8000_8100, // t: s_add_u32 s0, s0, 1
+            0xBF07_8000, // s_cmp_lg_u32 s0, 0
+            0xBF85_0002, // s_cbranch_scc1 -> out
+            0xBF82_FFFC, // b: s_branch -> t
+            0xBF82_0000, // side: s_branch -> out
+            0xBE82_0300, // out: s_mov_b32 s2, s0
+            S_ENDPGM,
+        ];
+        lowers(&words, 0).unwrap();
     }
 }
