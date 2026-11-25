@@ -1,0 +1,13 @@
+# Configuration for actions/labeler (v5 syntax).
+# Labels pull requests automatically based on the paths they touch.
+
+documentation:
+  - changed-files:
+      - any-glob-to-any-file:
+          - "docs/**"
+          - "*.md"
+
+ci:
+  - changed-files:
+      - any-glob-to-any-file:
+          - ".github/**"

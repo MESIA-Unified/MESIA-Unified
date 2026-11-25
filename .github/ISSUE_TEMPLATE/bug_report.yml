@@ -1,0 +1,60 @@
+name: Documentation bug report
+description: Report an error in the public content of this repository (docs, status, FAQ, roadmap).
+title: "[docs] "
+labels: ["bug", "documentation"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting a problem.
+
+        This repository contains **documentation only** — the MESIA Unified
+        engine source is private and is not tracked here. Please report
+        issues with the *public content* of this repository.
+
+  - type: textarea
+    id: description
+    attributes:
+      label: Description
+      description: What is wrong, and where? Include file/page names and links where possible.
+      placeholder: "The roadmap page states ..., but ..."
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected
+      description: What should the content say or show?
+    validations:
+      required: true
+
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual
+      description: What does it currently say or show?
+    validations:
+      required: true
+
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      description: Which part of the public content is affected?
+      options:
+        - docs
+        - status
+        - faq
+        - roadmap
+        - other
+    validations:
+      required: true
+
+  - type: textarea
+    id: context
+    attributes:
+      label: Additional context
+      description: Anything else — screenshots, related links, suggested wording.
+    validations:
+      required: false

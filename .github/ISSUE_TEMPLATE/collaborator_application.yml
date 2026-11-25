@@ -1,0 +1,90 @@
+name: Collaborator application
+description: Apply to collaborate on MESIA Unified. Every application is reviewed personally by the project owner.
+title: "[application] "
+labels: ["collaborator-application"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thank you for your interest in MESIA Unified — an experimental
+        Xbox Series compatibility engine for Windows.
+
+        The engine source is private while it undergoes license review.
+        This form is the **only** path to collaboration. Filing it does not
+        grant any access — see the terms at the bottom.
+
+  - type: input
+    id: handle
+    attributes:
+      label: Name / handle
+      description: How should we refer to you? Your GitHub username is fine.
+      placeholder: "@yourhandle"
+    validations:
+      required: true
+
+  - type: checkboxes
+    id: skills
+    attributes:
+      label: Skills
+      description: Check every area you have hands-on experience with.
+      options:
+        - label: "Rust — systems programming, unsafe code, FFI"
+        - label: "DirectX 12 — pipelines, resources, barriers, debug tooling"
+        - label: "GFX10/RDNA shader translation — DXIL, wave32, instruction encoding"
+        - label: "GPU memory management — heaps, residency, WDDM"
+        - label: "Compatibility systems — translation layers, emulation, ABI mapping"
+        - label: "Performance analysis and optimization"
+        - label: "Testing, fuzzing, and CI infrastructure"
+        - label: "Technical writing and documentation"
+    validations:
+      required: true
+
+  - type: textarea
+    id: experience
+    attributes:
+      label: Relevant experience
+      description: Tell us about projects, work, or research relevant to the skills you checked. Links welcome.
+      placeholder: "For example: worked on a D3D12 translation layer, reverse-engineered GPU command buffers, maintained docs for ..."
+    validations:
+      required: true
+
+  - type: checkboxes
+    id: areas
+    attributes:
+      label: Areas you want to contribute to
+      options:
+        - label: "Public documentation — guides, status pages, roadmap"
+        - label: "Technical review of published design notes"
+        - label: "Testing and compatibility reporting"
+        - label: "Engine development (if/when source access is granted)"
+        - label: "Tooling and CI"
+        - label: "Community support — issues and discussions"
+    validations:
+      required: true
+
+  - type: input
+    id: prior_projects
+    attributes:
+      label: Prior GitHub projects
+      description: Repositories or contributions that show your work (optional).
+      placeholder: "https://github.com/..."
+    validations:
+      required: false
+
+  - type: textarea
+    id: motivation
+    attributes:
+      label: Motivation
+      description: Why do you want to collaborate on MESIA Unified?
+    validations:
+      required: true
+
+  - type: checkboxes
+    id: terms
+    attributes:
+      label: Terms
+      options:
+        - label: "I understand this grants no automatic write access and the owner reviews applications personally."
+          required: true
+        - label: "My contributions will be original or compatibly licensed — no proprietary/leaked/DRM-circumvention material."
+          required: true

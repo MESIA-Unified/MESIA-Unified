@@ -1,0 +1,26 @@
+# --- Windows ------------------------------------------------------------
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+*.lnk
+
+# --- macOS ---------------------------------------------------------------
+.DS_Store
+
+# --- Editors -------------------------------------------------------------
+.vscode/
+.idea/
+*.sublime-project
+*.sublime-workspace
+*.swp
+*.swo
+*~
+*.bak
+
+# --- Logs ----------------------------------------------------------------
+*.log
+
+# --- Forward compatibility ------------------------------------------------
+# Rust build output, for when/if source is added to a public tree.
+target/
