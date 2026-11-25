@@ -67,4 +67,4 @@ Build diagnostics : `cargo build --profile diag -p mesia --features diagnostics`
 
 ## Licence
 
-GPL-3.0-or-later (voir `LICENSE`). Basé sur MESIA (Marvisak) et mesia-fork (fxceless).
+GPL-3.0-or-later (voir `LICENSE`). Basé sur VIctory (Marvisak) et victory-fork (fxceless).
