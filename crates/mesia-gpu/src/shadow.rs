@@ -961,6 +961,15 @@ pub(crate) fn wide_back() -> bool {
     *ON.get_or_init(|| std::env::var_os("MESIA_WIDE_BACK").is_some_and(|v| v == "1"))
 }
 
+/// `MESIA_WIDE_MERGE=1`: a landing's merges ([`Shadow::relay_merge`]) of
+/// work items whose title ranges cannot meet run on the kept threads
+/// ([`wide`]); ones of a copy, or whose ranges overlap, keep their order
+/// in one job.
+pub(crate) fn wide_merge() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("MESIA_WIDE_MERGE").is_some_and(|v| v == "1"))
+}
+
 type Job = Box<dyn FnOnce() + Send>;
 
 /// Threads kept for [`wide`]: what they are to do, and the word that there
@@ -1201,6 +1210,97 @@ fn find_pieces(scans: Vec<(usize, usize, usize, usize, usize)>) -> Vec<Vec<(usiz
     out
 }
 
+/// With [`wide_merge`]: the merges of the pieces `found` for each item of
+/// `work` (a copy and its declared range, as [`find_all`] takes them),
+/// done by [`Shadow::relay_merge`]. A copy's own merges, and merges whose
+/// title ranges overlap, keep the order `work` gives inside one job;
+/// disjoint ones run on the kept threads ([`wide`]). Returns, per item of
+/// `work`, the bytes written to title memory.
+///
+/// The merges of one job touch title memory its items cover and no other
+/// job's: two jobs never write the same byte. The snapshot's lock orders
+/// a copy's merges as the one thread calling them in order did before.
+pub(crate) fn relay_merge_all(
+    work: &[(Arc<Shadow>, usize, usize)],
+    found: Vec<Vec<(usize, usize)>>,
+) -> Vec<usize> {
+    let spans: Vec<(usize, usize, usize)> = work
+        .iter()
+        .map(|(shadow, from, to)| {
+            (
+                Arc::as_ptr(shadow) as usize,
+                shadow.start as usize + from,
+                shadow.start as usize + to,
+            )
+        })
+        .collect();
+    let groups = merge_groups(&spans);
+    let shared = Arc::new((work.iter().map(|(s, f, t)| (s.clone(), *f, *t)).collect::<Vec<_>>(), found));
+    let written: Arc<Vec<AtomicU64>> = Arc::new((0..work.len()).map(|_| AtomicU64::new(0)).collect());
+    let jobs: Vec<Job> = groups
+        .into_iter()
+        .map(|items| {
+            let (shared, written) = (shared.clone(), written.clone());
+            Box::new(move || {
+                let (mut now, mut title) = (Vec::new(), Vec::new());
+                for i in items {
+                    let (shadow, ..) = &shared.0[i];
+                    let mut bytes = 0;
+                    for &(at, n) in &shared.1[i] {
+                        bytes += shadow.relay_merge(at, n, &mut now, &mut title);
+                    }
+                    written[i].store(bytes as u64, Ordering::Relaxed);
+                }
+            }) as Job
+        })
+        .collect();
+    wide(jobs);
+    written.iter().map(|w| w.load(Ordering::Relaxed) as usize).collect()
+}
+
+/// For [`relay_merge_all`]: items `(copy, title range start, end)` that
+/// must merge in one job, in the order given — of a copy (the snapshot's
+/// lock makes its merges one sequence), or whose title ranges touch.
+/// Disjoint ones may run at the same time on the kept threads. Union-find
+/// over the items; each group lists its items in the order given.
+fn merge_groups(spans: &[(usize, usize, usize)]) -> Vec<Vec<usize>> {
+    fn root_of(root: &mut [usize], i: usize) -> usize {
+        let mut r = i;
+        while root[r] != r {
+            r = root[r];
+        }
+        let mut j = i;
+        while root[j] != j {
+            let next = root[j];
+            root[j] = r;
+            j = next;
+        }
+        r
+    }
+    let mut root: Vec<usize> = (0..spans.len()).collect();
+    for i in 0..spans.len() {
+        for j in i + 1..spans.len() {
+            let (pi, ai, bi) = spans[i];
+            let (pj, aj, bj) = spans[j];
+            if pi == pj || (ai < bj && aj < bi) {
+                let (ra, rb) = (root_of(&mut root, i), root_of(&mut root, j));
+                if ra != rb {
+                    root[ra.max(rb)] = ra.min(rb);
+                }
+            }
+        }
+    }
+    let mut groups: Vec<(usize, Vec<usize>)> = Vec::new();
+    for i in 0..spans.len() {
+        let r = root_of(&mut root, i);
+        match groups.iter_mut().find(|(g, _)| *g == r) {
+            Some((_, items)) => items.push(i),
+            None => groups.push((r, vec![i])),
+        }
+    }
+    groups.into_iter().map(|(_, items)| items).collect()
+}
+
 /// Since the last frame-rate line, of the shader-written ranges looked for
 /// on the CPU (copies not in the card's memory): bytes snapshotted in
 /// windows outside buffers and in title buffers' copies; bytes compared in
@@ -1234,7 +1334,7 @@ pub(crate) fn back_line(frames: f64) {
 
 #[cfg(test)]
 mod wide_tests {
-    use super::{Job, PIECE, WIDE_JOB, copy_jobs, find_pieces, wide};
+    use super::{Job, PIECE, WIDE_JOB, copy_jobs, find_pieces, merge_groups, wide};
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -1312,6 +1412,30 @@ mod wide_tests {
         scans.push((0, 0, 0, 0, 0));
         wanted.push(Vec::new());
         assert_eq!(find_pieces(scans), wanted);
+    }
+
+    /// Items of a copy, or whose title ranges touch, land in one group in
+    /// the order given; disjoint ones get their own.
+    #[test]
+    fn merge_groups_keep_only_what_can_meet_together() {
+        // Empty.
+        assert!(merge_groups(&[]).is_empty());
+        // Disjoint ranges of different copies: each its own group.
+        assert_eq!(
+            merge_groups(&[(1, 0, 100), (2, 100, 200), (3, 500, 600)]),
+            vec![vec![0], vec![1], vec![2]]
+        );
+        // One copy's two items stay together, in order, whatever lies
+        // between them in the list.
+        assert_eq!(merge_groups(&[(1, 0, 10), (2, 50, 60), (1, 20, 30)]), vec![vec![0, 2], vec![1]]);
+        // Overlapping title ranges join even across copies; a bridge
+        // joins transitively (0~1 by overlap, 1~2 by overlap, so all).
+        assert_eq!(
+            merge_groups(&[(1, 0, 100), (2, 50, 150), (3, 100, 200), (4, 900, 1000)]),
+            vec![vec![0, 1, 2], vec![3]]
+        );
+        // Touching ends do not overlap ([0,10) and [10,20) are apart).
+        assert_eq!(merge_groups(&[(1, 0, 10), (2, 10, 20)]), vec![vec![0], vec![1]]);
     }
 }
 

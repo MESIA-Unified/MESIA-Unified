@@ -2429,6 +2429,19 @@ fn relay_hand_back(back: &[Declared]) {
     let found = crate::shadow::find_all(&work);
     #[cfg(feature = "diagnostics")]
     crate::copystat::add(crate::copystat::C::BackScanUs, scanning.elapsed().as_micros() as u64);
+    if crate::shadow::wide_merge() {
+        // Merges whose title ranges cannot meet on the kept threads;
+        // the others keep their order in one job (each item's count
+        // comes back in `work` order).
+        let written = crate::shadow::relay_merge_all(&work, found);
+        let total: usize = written.iter().sum();
+        COPY_BACK[1].fetch_add(total as u64, Ordering::Relaxed);
+        #[cfg(feature = "diagnostics")]
+        for ((_, from, to), written) in work.iter().zip(written) {
+            crate::copystat::compared(*from, to - from, written);
+        }
+        return;
+    }
     let (mut now, mut title) = (Vec::new(), Vec::new());
     for ((shadow, from, to), found) in work.iter().zip(found) {
         let mut written = 0;
