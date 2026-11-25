@@ -353,3 +353,43 @@ additional shader stages, depth/stencil, multi-RT, indexed and
 count-buffered indirect draws, a swapchain/present path, and
 device-removed recovery — all still verified on synthetic fixtures until
 legal title content exists.
+
+## Milestone 7 — Advanced commands + the first varying
+
+Milestone 6 left three honest gaps; this phase closed two of them
+completely and opened the graphics-varying door.
+
+**Count-buffer `ExecuteIndirect`, GPU-verified.** Indirect draws can now
+be counted *by the GPU*: a guest-produced counter in a buffer selects how
+many calls run — always under the explicit host cap (`MESIA_INDIRECT_MAX`).
+Verified on hardware: count=0 draws nothing, count=1 draws, count=70 000
+clamps to the cap. The stream validation enforces offset alignment,
+distinct args/count buffers, and a nonzero maximum.
+
+**`CopyBuffer` end to end.** Decoded copies verified byte-exact after
+readback, including the deepest sequence yet: guest compute *produces*
+draw arguments → `CopyBuffer` moves them through real state transitions →
+`ExecuteIndirect` consumes them. Same-buffer overlap is rejected,
+reported-size bounds checked, zero-byte copy is a defined no-op.
+
+**U-16 on the count path.** A skipped producer now neutralizes an indirect
+call whose *count* buffer it would have written — same guarantee as for
+args buffers, verified with zero texels produced.
+
+**The first interpolated varying.** A hand-assembled VS exports a real
+attribute (`exp param`) and a PS interpolates it via `v_interp_p1/p2` —
+producing a genuine perspective-correct gradient, pixel-verified against
+the expected NDC ramp. A `v_interp_mov` flat variant renders the provoking
+vertex's color uniformly. Remaining interp modes (centroid/sample,
+pull-model) stay documented gaps.
+
+**How it was verified (137/137 tests, 0 warnings).** +37 tests over
+Milestone 6: 15 indirect-validation CPU, 9 phase-7 GPU end-to-end, 8
+interp CPU, 3 executor logic, 2 interp GPU draws. All on synthetic
+fixtures; the interpolated output is a *gradient*, not a real title's
+pixels.
+
+**What's next.** Vertex fetch and the fetch-shader path, remaining interp
+modes, additional stages, depth/stencil, multi-RT, indexed draws, a
+swapchain/present path, device-removed recovery — still synthetic until
+legal title content exists.

@@ -19,6 +19,39 @@ Hardware-verified results were produced on a desktop NVIDIA RTX 3060 unless
 noted otherwise. For the narrative behind each milestone, see
 [docs/MILESTONES.md](docs/MILESTONES.md).
 
+## [Milestone 7 — Advanced commands + first varying] - 2026-11
+
+The command layer grows teeth: GPU-determined indirect counts, real
+buffer copies, and the first interpolated varying through the
+translated graphics path.
+
+### Added
+
+- **Count-buffer `ExecuteIndirect`** — a GPU-produced counter now picks
+  how many indirect calls run, always under the host cap
+  (`MESIA_INDIRECT_MAX`): count=0 draws nothing, count>cap clamps.
+- **`CopyBuffer` end to end** — decoded copies verified byte-exact,
+  with same-buffer overlap rejection, reported-size bounds, and a
+  defined zero-byte semantics.
+- **compute→copy→indirect chains** — guest compute produces draw
+  arguments, a `CopyBuffer` moves them through real state transitions,
+  `ExecuteIndirect` consumes them.
+- **U-16 on the count path** — a skipped producer's count buffer
+  neutralizes the indirect call exactly like a tainted args buffer.
+- **First interpolated varying** — a VS exports a real attribute and a
+  PS interpolates it (`v_interp_p1/p2` perspective, `v_interp_mov`
+  flat), producing a verified gradient / uniform color respectively.
+- Indirect-stream validation: offset alignment, args≠count, max>0.
+
+### Verified
+
+- **137/137 workspace tests, 0 warnings** — +37 over milestone 6:
+  15 indirect CPU, 9 phase-7 GPU e2e, 8 interp CPU, 3 executor logic,
+  2 interp GPU. All on synthetic fixtures; the interpolated result is
+  a *gradient*, not a real title's pixels.
+- Baseline recount: milestone-5's "64" was a reporting slip — the true
+  count was 63; the ledger is now exact.
+
 ## [Milestone 6 — Command-stream translation engine] - 2026-11
 
 The guest command layer: a recorded guest command stream is decoded into a

@@ -5,7 +5,7 @@ Private-lab ledger, phases 0–6. Every result in this document was
 game runs on this engine.
 
 Lab hardware: **NVIDIA RTX 3060 12 GB · Windows 11 · 16 GB RAM**.
-Current totals: **100 automated tests green, 0 warnings**.
+Current totals: **137 automated tests green, 0 warnings**.
 
 ## Per-phase ledger
 
@@ -17,15 +17,19 @@ Current totals: **100 automated tests green, 0 warnings**.
 | **3 — GPU resources + first render** | Real resources under budget, descriptor heaps, first pixels, persistent PSO cache | ✅ done | `GpuAllocator` with real `Evict`/`MakeResident`; heaps with null guard slot + null-fill; byte-exact triangle readback; `CachedPSO` warm create **5.2 ms vs 13.8 ms** cold (×2.65); journal → offline cache rebuild | 36/36 | Offscreen only (no swapchain); no command layer; PSO lanes designed, conservative | `gpu_render` + `gpu_alloc` + `gpu_cache` all green on RTX 3060 |
 | **4 — Shader translation** | `mesia-shader`: guest GFX10 container → DXIL, bound per SM 6.6 contract, dispatched | ✅ done | Real guest DXBC containers (DXIL/XDAT/XBCH/FSSM) translated; const-store readback-exact; **wave64 OR-reduce → `0xFFFF_FFFF` on 32-lane host** after `WaveLaneCountMax` config; journal v2 replays translation offline | 51/51 | Compute only; one wave64 program; f16 rounding documented (host toward-zero vs console nearest) | `wave64_or_reduce_runs_on_the_host_gpu` — translate 833 µs |
 | **5 — Translated graphics** | VS/PS through the same pipeline; multi-stage signatures; command-layer design | ✅ done | `ISG1`/`OSG1`/`PSG1` + stage-data writers; hand-assembled GFX10 VS+PS → graphics PSO → `DrawInstanced` → **2016/4096 green texels, pixel-exact**; repeat draws byte-identical, PSO built once; U-16 spec fully recovered (audit) | 64/64 | One fixture pair; no vertex fetch, varyings, VS resources, GS/HS/DS/MS, depth, MRT | `translated_triangle_renders` — byte-exact inside/outside |
-| **6 — Command translation** | `mesia-command`: stream → IR → guard → execute on the shared device | ✅ done | `MESC` lab stream decoded to 12-op IR; decoded Draw → pixel-exact triangle; decoded Dispatch → translated compute; **compute-produced args → real `ExecuteIndirect`** (U-16 happy path); **Broken producer → neutralized, zero texels** (U-16 protection) | 100/100 | Lab stream format only (no console-format claim); no indexed draws/scissor op/multi-RT; count-buffer indirect parsed, untested on GPU | `skipped_producer_neutralizes_indirect` + `compute_produces_indirect_draws_it` |
+| **6 — Command translation** | `mesia-command`: stream → IR → guard → execute on the shared device | ✅ done | `MESC` lab stream decoded to 12-op IR; decoded Draw → pixel-exact triangle; decoded Dispatch → translated compute; **compute-produced args → real `ExecuteIndirect`** (U-16 happy path); **Broken producer → neutralized, zero texels** (U-16 protection) | 100/100 | Lab stream format only (no console-format claim); no indexed draws/scissor op/multi-RT | `skipped_producer_neutralizes_indirect` + `compute_produces_indirect_draws_it` |
+| **7 — Advanced commands + first varying** | count-buffer indirect, real CopyBuffer, interpolated attributes | ✅ done | `CopyBuffer` byte-exact incl. compute→copy→indirect chain; **count-buffer `ExecuteIndirect`**: GPU count 0/1/70000 vs host cap verified; U-16 neutralizes a tainted *count* buffer too; **first varying**: VS `exp param` + PS `v_interp` → a real interpolated gradient (and flat variant), pixel-verified | 137/137 | Indirect still single-signature-type Draw/Dispatch; interp verified on one channel pair (perspective+flat); no indexed draws/MRT/depth | `indirect_count_capped_by_max`, `translated_vinterp_gradient_renders` |
 
 ## Cumulative test growth
 
 ```text
 phase 0   ▍  3      phase 3   ▍ 36
-phase 1   ▍ 10      phase 4   ▍ 51
-phase 2   ▍ 21      phase 5   ▍ 64      phase 6  ▍ 100  ✅ 0 warnings
+phase 1   ▍ 10      phase 4   ▍ 51      phase 7  ▍ 137  ✅ 0 warnings
+phase 2   ▍ 21      phase 5   ▍ 63      phase 6  ▍ 100
 ```
+
+(Milestone-5 reports previously read "64" — a reporting arithmetic slip;
+the true count at both ends of phase 5 is 63. The ledger above is exact.)
 
 ## Standing constraints & documented design issues
 
@@ -40,7 +44,7 @@ phase 2   ▍ 21      phase 5   ▍ 64      phase 6  ▍ 100  ✅ 0 warnings
 | `ID3D12PipelineLibrary` escalates malformed blobs to adapter-wide `DEVICE_REMOVED` on this driver — mitigated by per-PSO `CachedPSO` + hash-verified envelope | mitigated by design |
 | Translator `host_max_wave` is process-global — engine contract: `configure_translation(dev)` before translating; folded into cache key | mitigated by contract |
 | f16 rounding: host toward-zero vs console nearest — `a console-exact f16 rounding flag` exists in the translator, not yet an engine option | documented |
-| Translated graphics breadth — the honest list: no vertex fetch, varyings, VS resources, extra stages, depth/stencil, MRT | roadmap |
+| Translated graphics breadth — the honest list: no vertex fetch, VS resources, extra stages, depth/stencil, MRT; varyings now verified on one channel pair (perspective + flat) | roadmap |
 
 ## How to read the numbers
 

@@ -2,7 +2,7 @@
 
 [![License: CC-BY-4.0](https://img.shields.io/badge/license-CC--BY--4.0-blue)](LICENSE)
 [![Status: experimental research](https://img.shields.io/badge/status-experimental%20research-orange)](ROADMAP.md)
-[![Tests: 100 automated checks (private lab)](https://img.shields.io/badge/tests-100%20automated%20checks%20%28private%20lab%29-green)](docs/DEVELOPMENT_STATUS.md)
+[![Tests: 137 automated checks (private lab)](https://img.shields.io/badge/tests-137%20automated%20checks%20%28private%20lab%29-green)](docs/DEVELOPMENT_STATUS.md)
 
 **An experimental Xbox Series compatibility engine for Windows**, written in Rust on
 top of DirectX 12, with GFX10→DXIL shader translation. MESIA Unified is a
@@ -62,7 +62,7 @@ Six crates, one engine — details in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.m
 
 ## Where it stands
 
-Six integration phases completed in the private lab, **100 automated tests green,
+Seven integration phases completed in the private lab, **137 automated tests green,
 0 warnings** on the lab hardware (NVIDIA RTX 3060 12 GB, Windows 11, 16 GB RAM).
 Full milestone text in [ROADMAP.md](ROADMAP.md) and
 [docs/DEVELOPMENT_STATUS.md](docs/DEVELOPMENT_STATUS.md). Highlights:
