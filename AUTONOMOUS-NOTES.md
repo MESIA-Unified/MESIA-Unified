@@ -80,3 +80,13 @@ Correct : `abort` doit sauter à `out` (sortie du header `t`) **avec les phis re
 
 ### `mesia run` attend l'EXE du jeu, pas le dossier
 `fs::read(exe)` sur un dossier → os error 5 « Accès refusé ». play.ps1 `-Game` = chemin de `game_scarlett_master.exe`.
+
+## 2026-11-25 (fin de session) — résultats
+
+- Boot à cache chaud : sélecteur de profil atteint en ~1 min (avant : tempête ~40 min ou infinie à cause des kills).
+- Tempête finie (~2400) en ~7 min à ~2-15/s (vs 0.2/s avant le boost worker).
+- `mesia run` prend l'EXE : `-Game ...\game_scarlett_master.exe`.
+- Resize fenêtre ≠ résolution interne (rendu à résolution fixe du titre) — pas de levier GPU par là.
+- Frame cinématique ~766-826 ms : ~47% GPU (~380 ms) + ~390-590 ms CPU soumetteur (card idle behind us). Côté CPU = la cible Phase 2 (F1: watch/copies/binding, relay_wait ~200 ms).
+- `play.ps1 -Fast` : COPY_MODE=plain, GUARD_HOLES=0, UNWATCHED_FRAMES=4 — 1er essai fluidité>fidélité (textures pouvant stagner).
+- GitHub : tout pushé jusqu'à 62068a3.
