@@ -105,35 +105,75 @@ struct KeyState {
 
 const _: () = assert!(size_of::<KeyState>() == 12 && size_of::<PadState>() == 28);
 
+/// The host mouse between two polls: how far the cursor travelled (right
+/// and up positive), and which buttons are held.
+#[derive(Clone, Copy, Default)]
+struct MouseState {
+    dx: f32,
+    dy: f32,
+    /// Bit 0 left, 1 right, 2 middle.
+    buttons: u8,
+}
+
 /// Host input, or a fake in tests.
 trait Source: Send {
     /// The pad in host slot `slot`, `None` when the slot is empty.
     fn pad(&mut self, slot: usize) -> Option<PadState>;
     /// Keys held down; none while the title's window lacks focus.
     fn keys(&mut self) -> Vec<KeyState>;
+    /// The mouse since the last ask; still while the window lacks focus.
+    fn mouse(&mut self) -> MouseState {
+        MouseState::default()
+    }
     /// Motor speeds: low frequency (left), high frequency (right).
     fn rumble(&mut self, slot: usize, low: u16, high: u16);
 }
 
-fn fallback(keys: &[KeyState]) -> PadState {
-    let on = |vk: u8| {
+/// The keyboard's layout is AZERTY (French, Belgian French, ...): the
+/// movement keys are Z/Q/S/D there, not W/A/S/D.
+fn azerty() -> bool {
+    static ON: LazyLock<bool> = LazyLock::new(|| {
+        #[cfg(windows)]
+        // SAFETY: plain query; the low word of the layout is its language,
+        // and French layouts are AZERTY.
+        unsafe {
+            windows_sys::Win32::UI::Input::KeyboardAndMouse::GetKeyboardLayout(0) as u32 & 0xFF == 0x0C
+        }
+        #[cfg(not(windows))]
+        {
+            false
+        }
+    });
+    *ON
+}
+
+fn fallback(keys: &[KeyState], mouse: &MouseState) -> PadState {
+    let on = |vk: u8| -> f32 {
         if keys.iter().any(|k| k.virtual_key == vk) {
             1.0
         } else {
             0.0
         }
     };
+    let (up, left, down, right) = if azerty() {
+        (b'Z', b'Q', b'S', b'D')
+    } else {
+        (b'W', b'A', b'S', b'D')
+    };
+    // Mouse buttons stand in for the triggers (left click shoots, right
+    // aims); its travel turns the right stick.
+    let held = |bit: u8| -> f32 { f32::from(mouse.buttons & bit != 0) };
     PadState {
         buttons: FALLBACK_BUTTONS
             .iter()
             .filter(|(vk, _)| on(*vk) != 0.0)
             .fold(0, |all, (_, bit)| all | bit),
-        left_trigger: on(b'Z'),
-        right_trigger: on(b'C'),
-        left_x: on(b'D') - on(b'A'),
-        left_y: on(b'W') - on(b'S'),
-        right_x: on(b'L') - on(b'J'),
-        right_y: on(b'I') - on(b'K'),
+        left_trigger: (if azerty() { on(b'A') } else { on(b'Z') }).max(held(2)),
+        right_trigger: on(b'C').max(held(1)),
+        left_x: on(right) - on(left),
+        left_y: on(up) - on(down),
+        right_x: (on(b'L') - on(b'J') + mouse.dx).clamp(-1.0, 1.0),
+        right_y: (on(b'I') - on(b'K') + mouse.dy).clamp(-1.0, 1.0),
     }
 }
 
@@ -401,12 +441,12 @@ impl Hub {
 
     /// Reads the host once; device callbacks run on the calling thread.
     fn poll(&self) {
-        let (pads, keys) = {
+        let (pads, keys, mouse) = {
             let mut source = lock(&self.source);
             let pads: [_; PADS] = std::array::from_fn(|slot| source.pad(slot));
-            (pads, source.keys())
+            (pads, source.keys(), source.mouse())
         };
-        let events = self.state().poll(&self.devices, pads, keys);
+        let events = self.state().poll(&self.devices, pads, keys, mouse);
         self.deliver(events);
     }
 
@@ -451,6 +491,7 @@ impl State {
         devices: &[Device; DEVICES],
         pads: [Option<PadState>; PADS],
         keys: Vec<KeyState>,
+        mouse: MouseState,
     ) -> Vec<Event> {
         let now = now();
         let mut events = std::mem::take(&mut self.pending);
@@ -458,7 +499,7 @@ impl State {
         for (slot, pad) in pads.into_iter().enumerate() {
             self.update(devices, slot, pad.map(Value::Pad), now, &mut events);
         }
-        let fallback = (!any_pad).then(|| Value::Pad(fallback(&keys)));
+        let fallback = (!any_pad).then(|| Value::Pad(fallback(&keys, &mouse)));
         self.update(devices, FALLBACK, fallback, now, &mut events);
         self.update(devices, KEYBOARD, Some(Value::Keys(keys)), now, &mut events);
         events
@@ -1073,9 +1114,11 @@ mod host {
     use std::time::{Duration, Instant};
 
     use windows_sys::Win32::System::Threading::GetCurrentProcessId;
+    use windows_sys::Win32::Foundation::POINT;
     use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
         GetAsyncKeyState, MAPVK_VK_TO_VSC_EX, MapVirtualKeyW,
     };
+    use windows_sys::Win32::UI::WindowsAndMessaging::GetCursorPos;
     use windows_sys::Win32::UI::Input::XboxController::{
         XINPUT_GAMEPAD, XINPUT_GAMEPAD_A, XINPUT_GAMEPAD_B, XINPUT_GAMEPAD_BACK,
         XINPUT_GAMEPAD_DPAD_DOWN, XINPUT_GAMEPAD_DPAD_LEFT, XINPUT_GAMEPAD_DPAD_RIGHT,
@@ -1130,6 +1173,8 @@ mod host {
     #[derive(Default)]
     pub(super) struct Host {
         empty_until: [Option<Instant>; PADS],
+        /// The cursor at the last `mouse()` ask, for its travel since.
+        cursor: Option<(i32, i32)>,
     }
 
     impl Source for Host {
@@ -1186,6 +1231,27 @@ mod host {
                     ..Default::default()
                 })
                 .collect()
+        }
+
+        fn mouse(&mut self) -> MouseState {
+            if !focused() {
+                self.cursor = None;
+                return MouseState::default();
+            }
+            let mut at = POINT::default();
+            // SAFETY: room for the point.
+            if unsafe { GetCursorPos(&mut at) } == 0 {
+                return MouseState::default();
+            }
+            let (x, y) = self.cursor.replace((at.x, at.y)).unwrap_or((at.x, at.y));
+            // About this much stick per pixel of travel between polls.
+            const GAIN: f32 = 0.06;
+            let down = |vk: i32| u8::from(unsafe { GetAsyncKeyState(vk) } < 0);
+            MouseState {
+                dx: (at.x - x) as f32 * GAIN,
+                dy: (y - at.y) as f32 * GAIN,
+                buttons: down(0x01) | down(0x02) << 1 | down(0x04) << 2,
+            }
         }
 
         fn rumble(&mut self, slot: usize, low: u16, high: u16) {
@@ -1494,7 +1560,9 @@ mod tests {
         register(hub, KEYBOARD_KIND, 2, &log);
         assert_eq!(*log.lock().unwrap(), [(KEYBOARD, STATUS_CONNECTED, 0)]);
 
-        let keys = vec![key(b'W'), key(0x0D), key(b'L'), key(b'C')];
+        // The stick's "up" key follows the host layout (Z on AZERTY).
+        let up = if azerty() { b'Z' } else { b'W' };
+        let keys = vec![key(up), key(0x0D), key(b'L'), key(b'C')];
         host.lock().unwrap().keys = keys.clone();
         hub.poll();
         let r = current(hub, KEYBOARD_KIND, KEYBOARD).unwrap();
