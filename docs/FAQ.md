@@ -12,7 +12,7 @@ synthetic fixtures inside the private lab.
 
 ## Can it run any game at all?
 
-**No.** The engine is verified ethe reference engineusively on **synthetic fixtures** — lab-built
+**No.** The engine is verified exclusively on **synthetic fixtures** — lab-built
 PE binaries, hand-assembled GFX10 shader programs, and lab-format command
 streams. There is no legal title content on the development machine, no game
 has ever been loaded by this engine, and no game compatibility exists to
@@ -29,7 +29,7 @@ architecture, roadmap, reports) under CC-BY-4.0.
 
 ## Is it affiliated with Rockstar, Take-Two, or Microsoft?
 
-**No.** MESIA Unified is an unofficial community research project. It has no
+**No.** MESIA Unified is an unofficial personal research project. It has no
 affiliation with, sponsorship from, or endorsement by Rockstar Games, Take-Two
 Interactive, Microsoft, or anyone else. Trademarks are referenced only to
 identify research targets.
@@ -89,6 +89,15 @@ reproduced. The engine consumes third-party open-source components; the
 publication of its source awaits the license-compatibility resolution noted
 above. Nothing here is a tool for infringing anyone's rights: no game files,
 no circumvention, no redistribution.
+
+## Who's behind this?
+
+One developer — systems/graphics work for 5+ years, and a weakness for the
+kind of problem most people uninstall drivers over. The project started as a
+weekend "what-if" (can console-grade GPU work run on a plain PC D3D12 stack?)
+and kept going because it stayed fun. There's no company, no team, and no
+deadline — just a documented experiment, published in case it helps or
+entertains anyone else who likes this corner of computing.
 
 ## Why is it called "Unified"?
 

@@ -6,9 +6,19 @@
 
 **An experimental Xbox Series compatibility engine for Windows**, written in Rust on
 top of DirectX 12, with GFX10→DXIL shader translation. MESIA Unified is a
-community research project studying how Xbox Series binaries could be loaded,
-their GPU command streams interpreted, and their shaders recompiled for PC
-hardware — as a single, unified engine.
+personal spare-time research project studying how Xbox Series binaries could be
+loaded, their GPU command streams interpreted, and their shaders recompiled for
+PC hardware — as a single, unified engine.
+
+> **Why does this exist?** Honestly — for fun. I'm a systems/graphics developer
+> with 5+ years of low-level work behind me, and one weekend I wondered whether
+> console-grade GPU work could be coaxed onto a plain PC D3D12 stack. What
+> started as a small "load a weird executable" experiment turned into PE
+> mapping, then a fence discipline problem, then a shader translator, then a
+> command-stream engine — the kind of project you start "for a weekend" and
+> find yourself still debugging barriers for, months later. It's a playground
+> for hard GPU problems, shared publicly in case the journey helps or
+> entertains anyone else.
 
 > **This repository ships documentation only.** The engine source is developed in
 > a private lab and is not yet published — a license-compatibility review across
@@ -25,9 +35,10 @@ MESIA Unified is **research infrastructure**, not a product and not an emulator
 you can download and play games on. Everything verified so far was verified on
 **hand-assembled synthetic fixtures built inside the lab — not on real titles**.
 
-- **Long-term ambition:** run *GTA VI* (Xbox Series build) on PC. This is a
-  stated ambition only — nothing here runs, boots, or renders that title or any
-  other real game.
+- **Long-term ambition:** run *GTA VI* (Xbox Series build) on PC — the moonshot
+  that keeps the project interesting. Stated ambition only: nothing here runs,
+  boots, or renders that title or any other real game, and it may never get
+  there. The point is everything learned on the way.
 - **Today:** a unified engine skeleton with a PE loader, a D3D12 backend with
   budgeted GPU memory, a persistent pipeline cache, a GFX10→DXIL shader
   translation service, and a guest-command decode/guard/execute layer — each
@@ -119,7 +130,8 @@ the [issue tracker](https://github.com/MESIA-Unified/MESIA-Unified/issues).
 
 ## Legal status & disclaimer
 
-MESIA Unified is an **unofficial community research project**. It is not
+MESIA Unified is an **unofficial personal research project**, built for fun in
+spare time. It is not
 affiliated with, sponsored by, or endorsed by Rockstar Games, Take-Two
 Interactive, Microsoft, or any other company. "Xbox", "Xbox Series", "GTA", and
 "GTA VI" are trademarks of their respective owners; references are for

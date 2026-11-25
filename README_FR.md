@@ -6,10 +6,21 @@
 
 **Un moteur de compatibilité expérimental pour les binaires Xbox Series sous
 Windows**, écrit en Rust au-dessus de DirectX 12, avec traduction de shaders
-GFX10→DXIL. MESIA Unified est un projet de recherche communautaire qui étudie
-comment les exécutables Xbox Series pourraient être chargés, leurs flux de
-commandes GPU interprétés et leurs shaders recompilés pour le matériel PC —
-dans un moteur unique et unifié.
+GFX10→DXIL. MESIA Unified est un projet de recherche personnel, mené sur mon
+temps libre, qui étudie comment les exécutables Xbox Series pourraient être
+chargés, leurs flux de commandes GPU interprétés et leurs shaders recompilés
+pour le matériel PC — dans un moteur unique et unifié.
+
+> **Pourquoi ce projet ?** Honnêtement — pour le plaisir. Je suis développeur
+> systèmes/graphique avec plus de cinq ans de bas niveau derrière moi, et un
+> week-end je me suis demandé si du travail GPU de niveau console pouvait
+> tourner sur une simple pile D3D12 de PC. Ce qui a commencé comme une petite
+> expérience « charger un exécutable bizarre » est devenu du mappage PE, puis
+> un problème de discipline de fences, puis un traducteur de shaders, puis un
+> moteur de flux de commandes — le genre de projet qu'on commence « pour un
+> week-end » et pour lequel on débogue encore des barrières des mois plus tard.
+> C'est un terrain de jeu pour problèmes GPU difficiles, partagé publiquement
+> au cas où le voyage aiderait — ou amuserait — quelqu'un d'autre.
 
 > **Ce dépôt ne publie que de la documentation.** Le code source du moteur est
 > développé dans un laboratoire privé et n'est pas encore publié — une analyse
@@ -28,9 +39,11 @@ MESIA Unified est une **infrastructure de recherche**, pas un produit ni un
 l'a été sur des **fixtures synthétiques assemblées à la main dans le laboratoire —
 pas sur de vrais jeux**.
 
-- **Ambition à long terme :** exécuter *GTA VI* (build Xbox Series) sur PC. Il
-  s'agit d'une ambition déclarée, rien de plus — rien ici n'exécute, ne démarre
-  ni ne rend ce titre ou aucun autre jeu réel.
+- **Ambition à long terme :** exécuter *GTA VI* (build Xbox Series) sur PC —
+  la mission lunaire qui rend le projet amusant. Ambition déclarée, rien de
+  plus : rien ici n'exécute, ne démarre ni n'affiche ce titre ni aucun autre
+  jeu réel, et ce n'est peut-être jamais le cas. L'intérêt, c'est tout ce
+  qu'on apprend en chemin.
 - **Aujourd'hui :** un squelette de moteur unifié comprenant un chargeur PE, un
   backend D3D12 avec mémoire GPU budgétée, un cache de pipelines persistant, un
   service de traduction de shaders GFX10→DXIL et une couche de
@@ -131,7 +144,8 @@ le modèle **collaborator application** (`.github/ISSUE_TEMPLATE/`), ou partez d
 
 ## Statut légal et avertissement
 
-MESIA Unified est un **projet de recherche communautaire non officiel**. Il n'est
+MESIA Unified est un **projet de recherche personnel non officiel**, développé
+pour le plaisir sur mon temps libre. Il n'est
 ni affilié à, ni sponsorisé ni approuvé par Rockstar Games, Take-Two
 Interactive, Microsoft ou toute autre société. « Xbox », « Xbox Series »,
 « GTA » et « GTA VI » sont des marques de leurs propriétaires respectifs ; les

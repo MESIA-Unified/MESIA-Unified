@@ -98,7 +98,7 @@ D3D12 device owner with a fence-guarded memory model.
   waking.
 - `FencePool`: the memory-pool adapter where budget + LRU eviction is
   epoch-guarded — a page is only evictable if its last submitted use has
-  completed. Pinned allocations are ethe reference engineuded; denial is a clean
+  completed. Pinned allocations are excluded; denial is a clean
   `BudgetExhausted`.
 
 **How it was verified (21/21 tests, 0 warnings).**
@@ -107,7 +107,7 @@ D3D12 device owner with a fence-guarded memory model.
   on a spawned thread (entry → exit 0 → result through bound imports),
   bind census.
 - `gpupool` (3 tests, deterministic mock clock): deferred frees wait for
-  the fence; in-flight allocations are never evicted; pinned ethe reference engineusion.
+  the fence; in-flight allocations are never evicted; pinned exclusion.
 - `gpu_device` (5 tests, on hardware): single device/queue, submit + fence
   wait, an **UPLOAD→DEFAULT→READBACK copy verified byte-exact**, registry
   tracking, deferred retire following the fence.

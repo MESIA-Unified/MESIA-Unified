@@ -28,7 +28,7 @@ Current state: **6 integration phases complete · 100 automated tests green,
 - Pluggable `ImportResolver` / `MissingImportPolicy` traits so HLE tables from
   either engine can drive binding.
 - **Byte-parity proven both ways**: normalized snapshots of the same title
-  mapped by the reference engine, the reference engine, and the unified mapper differ only inside a computed
+  mapped by two independent reference pipelines and the unified mapper differ only inside a computed
   "allowed set" (loadconfig patch fields, ImageBase, security cookie, TLS index,
   missing-import stubs). Every exported probe callable through both pipelines;
   TLS callbacks ran.
@@ -44,7 +44,7 @@ Current state: **6 integration phases complete · 100 automated tests green,
   queue, fence epochs, `submit`/`wait`, registry ledger — and device-removed
   *detection* (`u64::MAX` → `GetDeviceRemovedReason`).
 - `mesia-mem::gpupool::FencePool`: budget + LRU eviction arbitrated by the
-  fence (`last_use <= completed` required to free anything), pinned ethe reference engineusion,
+  fence (`last_use <= completed` required to free anything), pinned exclusion,
   deferred-free bytes committed until the epoch passes.
 - Hardware-verified: UPLOAD→DEFAULT→READBACK copy byte-exact; deferred retire
   follows the fence on the live queue. 21/21 tests green.

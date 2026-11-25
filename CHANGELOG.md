@@ -202,7 +202,7 @@ Mapped images execute, and the engine gets its single D3D12 device owner.
   waking.
 - Fence-guarded memory pool adapter: budget + LRU eviction, but only
   among allocations whose last submitted use has completed; pinned
-  ethe reference engineusion; clean `BudgetExhausted` denial when every candidate is in
+  exclusion; clean `BudgetExhausted` denial when every candidate is in
   flight.
 
 ### Verified
