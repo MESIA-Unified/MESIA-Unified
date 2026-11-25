@@ -123,7 +123,10 @@ impl Host {
             // wave decides whether console wave64 programs are lowered for
             // waves of 32; `WaveSize(64)` pipelines are refused here
             // otherwise. An explicit choice (MESIA_HOST_MAX_WAVE) wins.
-            if super::lower::host_max_wave() == 0 {
+            // Not in this crate's unit tests: the setting is global, and a
+            // test's device would change how every later test in the
+            // process lowers (they pick a host wave with TEST_HOST_WAVE).
+            if cfg!(not(test)) && super::lower::host_max_wave() == 0 {
                 let mut o1 = D3D12_FEATURE_DATA_D3D12_OPTIONS1::default();
                 if device
                     .CheckFeatureSupport(
