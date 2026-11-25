@@ -2,7 +2,8 @@
 # Usage: shot.ps1 [-Out path.png] [-Full]
 param(
     [string]$Out = "$env:TEMP\mesia-shot.png",
-    [switch]$Full
+    [switch]$Full,
+    [switch]$PrintWindow
 )
 Add-Type -AssemblyName System.Drawing
 Add-Type @"
@@ -36,7 +37,20 @@ if ($proc.Count -gt 0 -and -not $Full) {
 if ($w -le 0 -or $h -le 0) { Write-Error "bad rect $w x $h"; exit 1 }
 $bmp = New-Object System.Drawing.Bitmap $w, $h
 $g = [System.Drawing.Graphics]::FromImage($bmp)
-$g.CopyFromScreen($x, $y, 0, 0, $bmp.Size)
+if ($proc.Count -gt 0 -and -not $Full -and $PrintWindow) {
+    Add-Type @"
+using System;
+using System.Runtime.InteropServices;
+public class MesiaPw {
+    [DllImport("user32.dll")] public static extern bool PrintWindow(IntPtr h, IntPtr dc, uint flags);
+}
+"@
+    $hdc = $g.GetHdc()
+    [void][MesiaPw]::PrintWindow([IntPtr]$proc.MainWindowHandle, $hdc, 2)
+    $g.ReleaseHdc($hdc)
+} else {
+    $g.CopyFromScreen($x, $y, 0, 0, $bmp.Size)
+}
 $bmp.Save($Out, [System.Drawing.Imaging.ImageFormat]::Png)
 $g.Dispose(); $bmp.Dispose()
 Write-Output "saved $Out ($w x $h) proc=$($proc.Id)"

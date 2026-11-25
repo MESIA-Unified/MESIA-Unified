@@ -23,5 +23,7 @@ $env:MESIA_INPLACE = "1"
 $env:MESIA_TEXTURE_NO_WAIT = "1"
 $env:MESIA_JOIN_COPIES = "1"
 $env:MESIA_CARD_REHASH_RUNS = "1"
+$env:MESIA_WAVE_WIDE = "0"
+$env:MESIA_PIPELINE_WORKERS = "12"
 & $Exe run $Game --execute 2>&1 | Out-File "$env:TEMP\mesia.log" -Encoding utf8
 Write-Host "Exited with $LASTEXITCODE; log: $env:TEMP\mesia.log"

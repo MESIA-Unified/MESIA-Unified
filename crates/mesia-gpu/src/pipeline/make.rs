@@ -16,7 +16,7 @@
 //! runs only once and whose pipeline takes longer is lost.
 
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -41,6 +41,11 @@ pub(crate) struct Pending {
     /// whether a draw or dispatch has requested it yet.
     key: String,
     used: AtomicBool,
+    /// The worker making it (0: none yet): a `wait` on it raises that
+    /// worker for the make's length, as the title's own threads crowd the
+    /// below-normal workers out while it loads (run 83's storm: ~0.2 makes
+    /// a second).
+    builder: AtomicU32,
 }
 
 // SAFETY: D3D12 objects are free-threaded; the graphics state (whose input
@@ -67,12 +72,21 @@ impl Pending {
             done: (Mutex::new(()), Condvar::new()),
             waiters: AtomicUsize::new(0),
             used: AtomicBool::new(false),
+            builder: AtomicU32::new(0),
         }
     }
 
     fn make(&self) {
+        // The worker this make runs on, for `wait` to raise while the
+        // title's own threads crowd the below-normal workers.
+        #[cfg(windows)]
+        self.builder.store(
+            unsafe { windows::Win32::System::Threading::GetCurrentThreadId() },
+            Ordering::Relaxed,
+        );
         self.made
             .get_or_init(|| HostPipeline::new(&self.shaders, self.graphics.as_deref()));
+        self.builder.store(0, Ordering::Relaxed);
         // Wake this pipeline's waiters only. `made` is stored before this
         // read; a waiter increments `waiters` before it looks at `made`,
         // so one the count misses is one that will see `made` and not
@@ -219,6 +233,23 @@ fn wait(p: &Pending, frame: u64) {
         return;
     }
     let started = Instant::now();
+    // The title wants this pipeline now: the worker making it must not
+    // stand behind the title's own threads (below-normal) any more.
+    #[cfg(windows)]
+    {
+        use windows::Win32::Foundation::CloseHandle;
+        use windows::Win32::System::Threading::*;
+        let tid = p.builder.load(Ordering::Relaxed);
+        if tid != 0 {
+            unsafe {
+                let h = OpenThread(THREAD_SET_LIMITED_INFORMATION, false, tid);
+                if let Ok(h) = h {
+                    let _ = SetThreadPriority(h, THREAD_PRIORITY_NORMAL);
+                    let _ = CloseHandle(h);
+                }
+            }
+        }
+    }
     let (lock, done) = &p.done;
     let mut held = lock.lock().unwrap_or_else(|e| e.into_inner());
     // Registered before `made` is looked at: a `make` that stores it and
@@ -359,11 +390,21 @@ fn workers() -> bool {
                         let _ = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
                     }
                     loop {
+                        // A `wait` that raised this worker for the last
+                        // make does not keep it raised for the next.
+                        unsafe {
+                            use windows::Win32::System::Threading::*;
+                            let _ = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+                        }
                         next().make();
-                        // While work still waits, draining it matters more
-                        // than persisting: the save is left to `drained`.
+                        // A killed run loses every pipeline stored since
+                        // the last save, and a storm is never drained: it
+                        // only saves when the queue empties. Persist as it
+                        // drains instead (throttled inside `save`).
                         if WAITING.fetch_sub(1, Ordering::Relaxed) == 1 {
                             drained();
+                        } else {
+                            super::library::save(false);
                         }
                     }
                 });
