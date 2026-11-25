@@ -129,12 +129,14 @@ pub extern "system" fn XMemVirtualAlloc(
     let constrained = base.is_null();
     if constrained {
         kind |= MEM_RESERVE;
-        // The GPU side copies only the pages the title wrote since its last
-        // copy (`mesia_gpu`, decision 0007); placeholders cannot be
-        // watched (their physical-page views are copied whole).
-        if kind & MEM_RESERVE_PLACEHOLDER == 0 {
-            kind |= MEM_WRITE_WATCH;
-        }
+    }
+    // The GPU side copies only the pages the title wrote since its last
+    // copy (`mesia_gpu`, decision 0007); placeholders cannot be watched
+    // (their physical-page views are copied whole). A reservation at the
+    // title's own address is watched too: without it its shadow copies
+    // are blind to the title's writes and show stale bytes for frames.
+    if kind & MEM_RESERVE != 0 && kind & MEM_RESERVE_PLACEHOLDER == 0 {
+        kind |= MEM_WRITE_WATCH;
     }
     // SAFETY: the title's own arguments, cleaned of console bits; the
     // parameter points at `requirements`, which outlives the call.
@@ -1010,6 +1012,36 @@ mod tests {
         // SAFETY: our own reservation.
         assert_ne!(unsafe { VirtualFree(p, 0, MEM_RELEASE) }, 0);
         assert_eq!(query(p).flags, 0);
+        // A reservation at the title's own address is watched too, so
+        // its shadow copies see the writes (the stale-images bug).
+        let probe =
+            unsafe { VirtualAlloc(std::ptr::null_mut(), 4 * MIB, MEM_RESERVE, PAGE_NOACCESS) };
+        assert!(!probe.is_null());
+        // SAFETY: our own reservation.
+        assert_ne!(unsafe { VirtualFree(probe, 0, MEM_RELEASE) }, 0);
+        let p = XMemVirtualAlloc(probe, 4 * MIB, MEM_RESERVE | MEM_COMMIT, 0, PAGE_READWRITE);
+        assert_eq!(p, probe, "the title's own address was not honoured");
+        // SAFETY: 4 MiB of ours, committed.
+        unsafe { p.cast::<u8>().add(3 * 4096).write_bytes(0xcd, 16) };
+        let (mut found, mut count, mut granularity) = ([0usize; 16], 16, 0);
+        // SAFETY: room for `count` addresses.
+        let watched = unsafe {
+            windows_sys::Win32::System::Memory::GetWriteWatch(
+                0,
+                p,
+                4 * MIB,
+                found.as_mut_ptr().cast(),
+                &mut count,
+                &mut granularity,
+            )
+        };
+        assert_eq!(watched, 0, "write-watch refused a fixed base");
+        assert!(
+            found[..count].contains(&((p as usize) + 3 * 4096)),
+            "the write was not tracked: {found:?}"
+        );
+        // SAFETY: our own reservation.
+        assert_ne!(unsafe { VirtualFree(p, 0, MEM_RELEASE) }, 0);
         // No address field: above the 32-bit range and below 2^40, where
         // the console keeps it.
         let p = XMemVirtualAlloc(
