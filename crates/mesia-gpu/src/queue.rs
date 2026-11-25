@@ -826,10 +826,12 @@ extern "system" fn present(
         && let Some(host) = crate::host::host()
     {
         const COPY_SOURCE: u32 = 0x800;
-        let state = crate::resource::host_transition(resource, COPY_SOURCE)
-            .map_or(COPY_SOURCE, |(_, before)| before);
+        // The present copy takes the texture to COPY_SOURCE and back to
+        // its state: the tracked state is true throughout — reading it
+        // (not swapping it) keeps concurrent submissions' preludes
+        // seeing the real state, and loses no update they made.
+        let state = crate::resource::host_state(resource).unwrap_or(COPY_SOURCE);
         let shown = host.present(texture, state, frame);
-        crate::resource::host_transition(resource, state);
         #[cfg(feature = "diagnostics")]
         blinks(frame, resource, state, shown);
         #[cfg(not(feature = "diagnostics"))]

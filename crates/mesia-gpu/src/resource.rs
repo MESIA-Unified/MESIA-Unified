@@ -1576,7 +1576,7 @@ pub(crate) fn placed_textures() -> u64 {
 
 /// Moves the host texture to `wanted` (a host texture state); the host
 /// resource and the state it leaves, if that is a change.
-#[cfg(windows)]
+#[cfg(all(windows, test))]
 pub(crate) fn host_transition(this: This, wanted: u32) -> Option<(*mut c_void, u32)> {
     use windows::core::Interface;
     let (host, _) = hosted(this, true)?;
@@ -1584,6 +1584,17 @@ pub(crate) fn host_transition(this: This, wanted: u32) -> Option<(*mut c_void, u
         .state
         .swap(wanted, std::sync::atomic::Ordering::Relaxed);
     (before != wanted).then(|| (host.texture.as_raw(), before))
+}
+
+/// The tracked host state of the host texture (`host_transition`'s
+/// `before`), read without changing it. For paths that hand the state to
+/// a list which restores it (present's copy): swapping would show a
+/// transient state to submissions prepared meanwhile, and restoring
+/// could clobber a state they left.
+#[cfg(windows)]
+pub(crate) fn host_state(this: This) -> Option<u32> {
+    let (host, _) = hosted(this, true)?;
+    Some(host.state.load(std::sync::atomic::Ordering::Relaxed))
 }
 
 /// The host GPU's copy of a title resource, if it has one: made now if

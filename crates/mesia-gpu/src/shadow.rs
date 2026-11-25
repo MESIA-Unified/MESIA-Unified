@@ -1262,7 +1262,7 @@ pub(crate) fn relay_merge_all(
 /// lock makes its merges one sequence), or whose title ranges touch.
 /// Disjoint ones may run at the same time on the kept threads. Union-find
 /// over the items; each group lists its items in the order given.
-fn merge_groups(spans: &[(usize, usize, usize)]) -> Vec<Vec<usize>> {
+pub(crate) fn merge_groups(spans: &[(usize, usize, usize)]) -> Vec<Vec<usize>> {
     fn root_of(root: &mut [usize], i: usize) -> usize {
         let mut r = i;
         while root[r] != r {

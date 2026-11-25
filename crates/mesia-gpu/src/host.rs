@@ -3092,6 +3092,15 @@ impl Host {
                             list.SetComputeRoot32BitConstants(0, 6, constants.as_ptr().cast(), 0);
                             list.Dispatch(run.pieces.div_ceil(64), 1, 1);
                         }
+                        if !ranges.is_empty() {
+                            // The next send copies into the buffer: back to
+                            // COPY_DEST, as the tracked state stays.
+                            list.ResourceBarrier(&[transition(
+                                &shadow.buffer,
+                                D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                                D3D12_RESOURCE_STATE_COPY_DEST,
+                            )]);
+                        }
                     }
                     list.Close()?;
                     self.queue.ExecuteCommandLists(&[Some(list.cast()?)]);
@@ -3566,17 +3575,34 @@ impl Host {
                 CARD_STATS[6].fetch_add(waiting.elapsed().as_micros() as u64, Ordering::Relaxed);
             }
             if wide_merge() && pieces.len() >= 8 {
-                // The pieces are apart from one another (each its own bytes
-                // of its copy and of title memory): several at a time.
+                // Several pieces at a time, but pieces of a copy, or whose
+                // declared title ranges touch, keep their order in one job
+                // (two copies can cover the same title bytes).
                 let fetched = *data;
                 let counts: std::sync::Arc<Vec<std::sync::atomic::AtomicUsize>> =
                     std::sync::Arc::new((0..plan.ranges.len()).map(|_| std::sync::atomic::AtomicUsize::new(0)).collect());
-                let each = pieces.len().div_ceil(8);
-                let jobs: Vec<Box<dyn FnOnce() + Send>> = pieces
-                    .chunks(each)
-                    .map(|chunk| {
-                        let chunk: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize, usize, u64)> =
-                            chunk.iter().map(|&(i, lo, hi, at)| (plan.ranges[i].shadow.clone(), i, lo, hi, at)).collect();
+                let spans: Vec<(usize, usize, usize)> = pieces
+                    .iter()
+                    .map(|&(i, ..)| {
+                        let r = &plan.ranges[i];
+                        (
+                            std::sync::Arc::as_ptr(&r.shadow) as usize,
+                            r.declared.0,
+                            r.declared.1,
+                        )
+                    })
+                    .collect();
+                let groups = crate::shadow::merge_groups(&spans);
+                let jobs: Vec<Box<dyn FnOnce() + Send>> = groups
+                    .into_iter()
+                    .map(|group| {
+                        let chunk: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize, usize, u64)> = group
+                            .into_iter()
+                            .map(|p| {
+                                let (i, lo, hi, at) = pieces[p];
+                                (plan.ranges[i].shadow.clone(), i, lo, hi, at)
+                            })
+                            .collect();
                         let counts = counts.clone();
                         Box::new(move || {
                             let mut title = Vec::new();

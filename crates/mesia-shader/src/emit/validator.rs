@@ -8,7 +8,9 @@
 use std::ffi::c_void;
 use std::path::PathBuf;
 
-use windows_sys::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryW};
+use windows_sys::Win32::System::LibraryLoader::{
+    GetProcAddress, LoadLibraryExW, LOAD_LIBRARY_SEARCH_SYSTEM32,
+};
 
 type Hresult = i32;
 
@@ -141,9 +143,14 @@ impl Validator {
             .encode_utf16()
             .chain([0])
             .collect();
-        // SAFETY: plain Win32 calls with a NUL-terminated name.
+        // SAFETY: plain Win32 calls with a NUL-terminated name; a bare
+        // name is resolved inside System32 only, not the search order.
         unsafe {
-            let module = LoadLibraryW(name.as_ptr());
+            let module = LoadLibraryExW(
+                name.as_ptr(),
+                std::ptr::null_mut(),
+                LOAD_LIBRARY_SEARCH_SYSTEM32,
+            );
             if module.is_null() {
                 return Err(format!("cannot load {}", String::from_utf16_lossy(&name)));
             }
