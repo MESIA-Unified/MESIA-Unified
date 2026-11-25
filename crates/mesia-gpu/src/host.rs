@@ -182,6 +182,17 @@ fn bury(finished: u64) {
     drop(done);
 }
 
+/// The submission being prepared right now (`STARTED` was bumped for it
+/// before its deferred work ran).
+pub(crate) fn current_submission() -> u64 {
+    STARTED.load(Ordering::Acquire)
+}
+
+/// Whether `submission` may still be running on the card.
+pub(crate) fn in_air(submission: u64) -> bool {
+    submission > FINISHED.load(Ordering::Acquire)
+}
+
 /// Objects [`retire`] dropped at once (no submission was running) and
 /// kept until a running submission finished, since the start.
 static RETIREMENTS: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
@@ -647,6 +658,15 @@ fn warp_adapter() -> windows::core::Result<IDXGIAdapter> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_submission_is_in_the_air_only_past_finished() {
+        use std::sync::atomic::Ordering::Relaxed;
+        let done = super::FINISHED.load(Relaxed);
+        assert!(!super::in_air(done));
+        assert!(super::in_air(done + 1));
+        assert_eq!(super::current_submission(), super::STARTED.load(Relaxed));
+    }
+
     #[test]
     fn sparse_copies_preserve_islands_and_observe_remaps() {
         use windows_sys::Win32::System::Memory::*;

@@ -88,6 +88,23 @@ pub(crate) struct HostHeap {
     placed: Mutex<Spans>,
 }
 
+impl Drop for HostHeap {
+    fn drop(&mut self) {
+        // A running submission may still read a slot of this heap: the
+        // resources the slots keep go the way a rewritten slot's does
+        // (`HostHeap::keep`), not down with the heap.
+        let kept = std::mem::take(
+            self.kept.get_mut().unwrap_or_else(|e| e.into_inner()),
+        );
+        if kept.iter().any(Option::is_some) {
+            crate::host::retire(kept);
+        }
+        if let Some((buffer, _, _)) = self.strides.take() {
+            crate::host::retire(buffer);
+        }
+    }
+}
+
 /// Title memory by the placed texture views that describe it: per span of
 /// memory (its start, its end) the title slots holding a view of a
 /// texture that takes exactly that span. Spans never overlap: a console

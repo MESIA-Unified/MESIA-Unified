@@ -56,6 +56,10 @@ pub(crate) struct Staging {
     uploaded: std::sync::atomic::AtomicBool,
     /// When a list last recorded a use of it (`crate::host::moment`).
     used: std::sync::atomic::AtomicU64,
+    /// The submission whose recorded copy last read the mapping: while it
+    /// is still in the air a refresh would detile under the flight's
+    /// reads, so it is left for the next submission.
+    submission: std::sync::atomic::AtomicU64,
 }
 
 /// What a texture's staging buffer holds: the hash of the memory detiled
@@ -610,8 +614,18 @@ impl Staging {
 
     /// Returns the bytes of title memory read.
     fn refresh_now(&self) -> usize {
+        use std::sync::atomic::Ordering::Relaxed;
+        // The copy a submission recorded may still be reading this mapping
+        // on the card: detiling now would write under its reads.
+        if crate::host::in_air(self.submission.load(Relaxed)) {
+            return 0;
+        }
         let whole = std::time::Instant::now();
         let read = self.refresh_timed();
+        if read != 0 {
+            self.submission
+                .store(crate::host::current_submission(), Relaxed);
+        }
         REFRESH_WAITS[3].fetch_add(whole.elapsed().as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
         read
     }
@@ -1050,6 +1064,7 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
         dirty: std::sync::atomic::AtomicBool::new(true),
         uploaded: std::sync::atomic::AtomicBool::new(false),
         used: std::sync::atomic::AtomicU64::new(crate::host::moment()),
+        submission: std::sync::atomic::AtomicU64::new(0),
     });
     map.insert(resource as usize, s.clone());
     Some(s)

@@ -1863,6 +1863,12 @@ impl Drop for Resource {
                 self.data() as u64,
             );
         }
+        // Copy-backs of submissions still in the air write this memory by
+        // address: free it when they land, as the host copy above is.
+        crate::host::retire(std::mem::replace(
+            &mut self.backing,
+            Backing::Address(std::ptr::null_mut()),
+        ));
     }
 }
 

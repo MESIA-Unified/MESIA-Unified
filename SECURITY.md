@@ -43,4 +43,4 @@ Include the commit, the affected module and a reproduction.
 - No network access during build; `xtask` runs only `cargo`/`git`.
 - Host DLL pass-through loads from `System32` only
   (`LOAD_LIBRARY_SEARCH_SYSTEM32`, regression-tested by
-  `tests/no_dll_planting.rs`).
+  `crates/mesia-hle/tests/no_dll_planting.rs`).
