@@ -1310,13 +1310,19 @@ impl State {
             .get_or_insert_with(Default::default)
             .entry(std::ptr::from_ref(host) as usize)
             .or_insert_with(|| (0, Ranges::new()));
-        let changed = host.buffer_changes();
-        let slots = if *passes % 16 == 0 {
-            ranges.clear();
-            host.buffer_slots()
-        } else {
-            changed
-        };
+        // Every slot must still be re-inspected: a view of a released
+        // resource goes stale without a write, and a slot written before
+        // its memory had a host copy is only made then. Walking the whole
+        // list every 16 passes was a ~2 s spike on an 83k-slot heap; each
+        // pass now walks the changed slots plus a rotating 1/16 of the
+        // list, so a stale view is still caught within 16 passes.
+        let mut slots = host.buffer_changes();
+        let all = host.buffer_slots();
+        let share = all.len().div_ceil(16);
+        let sweep = ((*passes as usize % 16) * share).min(all.len());
+        slots.extend_from_slice(&all[sweep..(sweep + share).min(all.len())]);
+        slots.sort_unstable();
+        slots.dedup();
         *passes += 1;
         // Whether the device was there before the pass: a view that removes
         // it is named below.
