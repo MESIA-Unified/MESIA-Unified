@@ -722,6 +722,11 @@ fn translated_shaders_draw_as_pc_ones() {
         eprintln!("no SM 6.6 device; skipped");
         return;
     };
+    // GPU runs one at a time (as in valu_tests): parallel device use has
+    // tripped a TDR under load.
+    let _one = super::valu_tests::ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     let dir = std::env::temp_dir().join(format!("mesia-diff-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let k = [0.75f32, -1.5, 2.0, 0.125].map(f32::to_bits);
@@ -878,6 +883,11 @@ fn translated_mesh_shaders_draw_as_pc_ones() {
         eprintln!("no SM 6.6 device; skipped");
         return;
     };
+    // GPU runs one at a time (as in valu_tests): parallel device use has
+    // tripped a TDR under load.
+    let _one = super::valu_tests::ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     let dir = std::env::temp_dir().join(format!("mesia-diff-ms-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let k = [0.75f32, -1.5, 2.0, 0.125].map(f32::to_bits);
@@ -995,6 +1005,11 @@ fn float_semantics_are_the_consoles() {
         eprintln!("no SM 6.6 device; skipped");
         return;
     };
+    // GPU runs one at a time (as in valu_tests): parallel device use has
+    // tripped a TDR under load.
+    let _one = super::valu_tests::ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     let dir = std::env::temp_dir().join(format!("mesia-float-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let src = r#"[RootSignature(RS)] [numthreads(4, 1, 1)]
@@ -1084,6 +1099,11 @@ fn translated_compute_matches_pc() {
         eprintln!("no SM 6.6 device; skipped");
         return;
     };
+    // GPU runs one at a time (as in valu_tests): parallel device use has
+    // tripped a TDR under load.
+    let _one = super::valu_tests::ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     let dir = std::env::temp_dir().join(format!("mesia-diff-cs-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let k = [0.75f32, -1.5, 2.0, 0.125].map(f32::to_bits);
