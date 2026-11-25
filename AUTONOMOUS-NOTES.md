@@ -7,7 +7,16 @@
 ## TDR — mécanisme prouvé (2026-11-25 soir)
 - **A/B GROUP_SYNC** : `=1` → corruption visible (cheveux/persos = bouillie magenta, échanges LDS racy). `=2` (défaut) → rendu propre. Donc des shaders avec `s_barrier` en région divergente **existent** ; le carve-out `fence_only` est utilisable en mode 1 mais casse la synchro dont ces barrières ont besoin quand tous les threads arrivent quand même.
 - **Conséquence** : en mode 2, une divergence runtime qui échoue à atteindre la barrière (sortie anticipée, ou LOOP_LIMIT `abort`→`Ret` pour les boucles `Jump`-latch — lower.rs:10624) fige le groupe → hang → TDR. Stochastique ✓.
-- **Audit lower.rs (agent 1f171d33)** — suspects classés : #1 s_barrier groupe-wait en bloc divergent (défaut `_ => true` wait) ; #2 LOOP_LIMIT abort→Ret échoue les barrières meeting/exchange post-boucle (fix = router abort vers le bloc de sortie `out` du header, pas Ret — à faire, ~30 lignes, voir lower.rs:10750) ; #3 dword `hi` non initialisé (CORRIGÉ, commit 447b6fa) ; #4 shortcut `lds_meetings` two-writes ; #5 cmpxchg retry hors LOOP_LIMIT ; #6 `widen()` activé au retry LANE_MASK malgré historique de perte carte (vérifier `MESIA_WAVE_WIDE=0`).
+- **Audit lower.rs (agent 1f171d33)** — suspects classés : #1 s_barrier groupe-wait en bloc divergent (défaut `_ => true` wait) ; #2 LOOP_LIMIT abort→Ret échoue les barrières meeting/exchange post-boucle ; #3 dword `hi` non initialisé (CORRIGÉ, commit 447b6fa) ; #4 shortcut `lds_meetings` two-writes ; #5 cmpxchg retry hors LOOP_LIMIT ; #6 `widen()` activé au retry LANE_MASK malgré historique de perte carte (vérifier `MESIA_WAVE_WIDE=0`).
+
+### Fix #2 — design validé (à implémenter, ~50 lignes dans lower.rs)
+Problème : latch `b` d'une boucle `Jump`-latch (`header: s_cbranch out; corps; s_branch header`) fait `CondBr(ok, header, abort)` avec `abort`→`Term::Ret` (lower.rs:10634-10638, `abort_block` :10761). Le lane quitte → barrières groupe post-boucle bloquées → TDR.
+Correct : `abort` doit sauter à `out` (sortie du header `t`) **avec les phis remplis** : la valeur entrante pour l'arête `t→out` est définie au plus tard dans `t` → domine `b` → rematérialisable dans le bloc abort.
+- Identifier `out` : `st.exits[t]` ; si `LaneExit::Branch{taken,not_taken}` → le successeur dont `rpo` ∉ (rpo[t], rpo[b]] est la sortie ; si ambigu → garder Ret (conservateur).
+- Créer `ab` (new DXIL block) terminant `Br(self.block[out])`; enregistrer `(ab, t, out)` dans une `Vec` sur self.
+- Dans `fill_phis` : pour chaque phi de `out`, pour chaque `(ab, t, out)` enregistré où `t` = pred index n → matérialiser la même valeur entrante (`phi.incoming[n]` / `args[n]`) dans `ab` et `incoming.push((x, ab))`.
+- Ne PAS rappeler `self.edge(t,out)` (pas de dédup — crée un 2e bloc orphelin = préd sans incoming).
+- Couverture : les boucles `Branch`-latch sont déjà correctes (limite ANDée à la condition → sortie naturelle, phis OK : lower.rs:10672-10679).
 - **Souris→caméra validée en gameplay** : drag souris → la caméra pivote (shots s34→s35).
 
 ## TDR — ce qui est écarté / confirmé
@@ -24,6 +33,24 @@
 - `b6827d6` diagnostics : probes xgamesave + marqueurs reset par site + scripts shot/drive.
 - `6034e61` cache-key inclut host_max_wave (déjà poussé).
 
+## Campagne V3 — audits livrés (2026-11-25)
+
+### A3 — durées de vie GPU (agent 6fe76fd0)
+- **#1 PRIME** : écritures `mirror`/`unmake` heap shader-visible depuis thread titre sans vérif in-flight (descriptor.rs:758-843→host.rs:1258) ; shaders bindless `root_indexed_views` lisent tout le heap (`heap_buffers` draw.rs:1270) → descripteur déchiré mi-vol → fault GPU → removed. Matche sync-stable/late-crash. Fix en cours (agent 92b5afbe).
+- **#2** : échecs `SetEventOnCompletion`/`Signal` avalés → land/finish/recycle contre travail non terminé (host.rs:4070, 4346-4389). Fix en cours (agent 5477a801).
+- **#3** : anneaux CPU RTV/DSV (`host.rs:4631-4660`, RTV_RING 1024) réécrits à l'enregistrement sans suivi d'exécution — course latente sous late.
+- Vérifiés sains : retire/bury, pools scratch/prelude/listes, `staging.in_air`, `p.ahead` (flown<=FINISHED), SHADER_HEAPS TOCTOU.
+
+### F1 — hot-path CPU (agent d1551c8b)
+- Top 1 estimé : pipeline refresh/copy sérialisé sur le thread de soumission (`run_deferred` + `Batch::flush` + watch/guard ~10 GB scannés FULL à chaque soumission — scan non incrémental). Flags d'isolation : `MESIA_ASK_ONCE=0`, `MESIA_GUARD_HOLES=0`, `MESIA_COPY_MODE=plain|none`, `MESIA_UNWATCHED_FRAMES`.
+- Top 2 : `relay_wait` ~200 ms/submission — le soumetteur attend le travail CPU du relay pendant GPU idle (host.rs:2346). Mesurer via `late_line`/`RELAY_STATS[4]`/`card_clock_line`.
+- Top 3 : `tables()`/`bind`/`heap_buffers` ×5000 draws (hash mémoire titre par table fraîche, `dynamic()` scan linéaire sous mutex, mirror par slot).
+- Quadratic flaggés : `find`+`Vec::contains` dédup O(ranges²) à declared_writes/card_before/settle/relay_land ; `watch::wrote` journal par page ; RTV/DSV ring.
+- Compteurs morts : `C::Queries/QueryUs/Skipped/SkippedBytes` imprimés mais jamais écrits — "queries 0.00 ms" n'est pas une donnée réelle.
+
+### A4 livré : breadcrumb applicatif (commit 11bbf2c)
+`fail()` dump `in-flight list` par liste en vol (soumission, pipelines, derniers steps ; vraies descriptions commandes sous feature diagnostics) — DRED unsupported (0x887A0004) confirmé.
+
 ## En attente / backlog
 - Mouse caméra : fix implémenté, **pas encore vérifié en gameplay** (cinématique en cours, input sans effet).
 - Cinématiques noires : slots device `0x1c8`/`0x218` non implémentés (16k appels/run) — RE profond.
@@ -36,3 +63,20 @@
 - `scripts/shot.ps1` capture fenêtre ; `scripts/drive.ps1` injecte touches/souris (focus réel requis).
 - `scripts/wer.ps1` liste les events nvlddmkm.
 - Env utiles : `MESIA_D3D12_DEBUG`, `MESIA_D3D12_DRED`, `MESIA_GPU_TIMING`, `MESIA_LOG=info,mesia_hle::modules::gameinput=trace` (besoin build `--features diagnostics` pour debug/trace).
+
+## 2026-11-25 (soir) — tempête de pipelines : cause racine + fixes
+
+### Pourquoi l'écran de chargement revenait toujours
+- `library::save` n'était appelé que quand la file se vide (`drained()`) ou à l'arrêt propre. Une tempête de ~2400 pipelines ne se vide JAMAIS avant un kill → tous les PSO `StorePipeline`'d depuis le boot perdus → tempête rejouée à zéro. Fix `fbf8577` : `save(false)` appelé dans la boucle worker à chaque make (throttle 20 s interne) → un kill ne perd que ≤20 s.
+- Workers à `THREAD_PRIORITY_BELOW_NORMAL` en permanence → affamés par les threads titre pendant le chargement (vidange ~0.2/s, ~40 s par make). Fix `fbf8577` : `wait()` passe le worker qui construit le pipeline attendu à `NORMAL` (`builder: AtomicU32` + OpenThread/SetThreadPriority), re-baisse en tête de boucle. Inspiré de `pso_async::want()` de xcl. Vidange mesurée ~2/s après fix (×10).
+- `play.ps1` : `MESIA_WAVE_WIDE=0` (widen retry path known-bad, audit B1) + `MESIA_PIPELINE_WORKERS=12` ajoutés.
+- `shot.ps1 -PrintWindow` : capture la fenêtre jeu même occultée (PW_RENDERFULLCONTENT).
+
+### Leçon xcl (github.com/xcl-dev/xcl, pso_async.rs)
+- Stand-in pipeline immédiat + vrai pipeline en worker (MESIA droppait les draws à la place).
+- `XCL_LAZY_PSO` : 51 000 pipelines créés/30 s, peu utilisés → builder au premier bind seulement. MESIA fait déjà l'équivalent (queue au premier `ready()`).
+- `xcl shaders --precompile --used-only` : précompile hors-jeu depuis `used-pipelines.txt`. MESIA a `mesia translate` (shaders seulement ; les PSO ont besoin de l'état graphique — pas de dump persistant de ça, à faire si les tempêtes restent un problème).
+- Worker count = taille du pool DXC (`compile_threads()`).
+
+### `mesia run` attend l'EXE du jeu, pas le dossier
+`fs::read(exe)` sur un dossier → os error 5 « Accès refusé ». play.ps1 `-Game` = chemin de `game_scarlett_master.exe`.
