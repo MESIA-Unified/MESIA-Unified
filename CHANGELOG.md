@@ -19,13 +19,18 @@
   NON_PIXEL_SHADER_RESOURCE; now restored to COPY_DEST.
 - **DLL search order** — `dxil.dll` loaded via `LoadLibraryW` by bare
   name; now `LoadLibraryExW` + `LOAD_LIBRARY_SEARCH_SYSTEM32`.
+- **Dump path policy** — `MESIA_CAPTURE`, `MESIA_DUMP_MATCH`,
+  `MESIA_FAIL_DUMP`, `MESIA_EMIT_DUMP`, `MESIA_SHADER_CENSUS` could write
+  game-derived files inside the source tree; now gated by
+  `ensure_outside_repo`.
 - Attribution line corrupted by the rename (`VIctory`/`victory-fork`).
 
 ### Added
 - `MESIA_WIDE_MERGE=1` — parallel copy-back merges (O1), off by default.
 - Test: fixed-base reservation write-watch tracking (xmem).
 - Docs: `test-inventory.md`, `memory-coherency.md`, `d3d12-validation.md`,
-  `concurrency-validation.md`, `SECURITY.md`, `THIRD_PARTY_NOTICES.md`,
+  `concurrency-validation.md`, `testing.md`, `benchmarks.md`,
+  `security-audit.md`, `SECURITY.md`, `THIRD_PARTY_NOTICES.md`,
   `CONTRIBUTING.md`, `ROADMAP.md`, `CHANGELOG.md`.
 
 ### Known issues
