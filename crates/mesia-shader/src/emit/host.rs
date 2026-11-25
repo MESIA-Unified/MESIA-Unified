@@ -119,6 +119,23 @@ impl Host {
                     sm.HighestShaderModel.0
                 ));
             }
+            // As the game's host does (mesia_gpu::host): the card's widest
+            // wave decides whether console wave64 programs are lowered for
+            // waves of 32; `WaveSize(64)` pipelines are refused here
+            // otherwise. An explicit choice (MESIA_HOST_MAX_WAVE) wins.
+            if super::lower::host_max_wave() == 0 {
+                let mut o1 = D3D12_FEATURE_DATA_D3D12_OPTIONS1::default();
+                if device
+                    .CheckFeatureSupport(
+                        D3D12_FEATURE_D3D12_OPTIONS1,
+                        (&raw mut o1).cast(),
+                        size_of_val(&o1) as u32,
+                    )
+                    .is_ok()
+                {
+                    super::lower::set_host_max_wave(o1.WaveLaneCountMax);
+                }
+            }
             Ok(Host { device })
         }
     }
@@ -142,6 +159,16 @@ impl Host {
     pub fn root_signature_for(
         &self,
         stages: &[(&HostShader, D3D12_SHADER_VISIBILITY)],
+    ) -> Result<ID3D12RootSignature, String> {
+        self.root_signature_of(stages, false)
+    }
+
+    /// As [`root_signature_for`], with the input-assembler flag dropped
+    /// for a compute pipeline (illegal there).
+    fn root_signature_of(
+        &self,
+        stages: &[(&HostShader, D3D12_SHADER_VISIBILITY)],
+        compute: bool,
     ) -> Result<ID3D12RootSignature, String> {
         let mut params: Vec<D3D12_ROOT_PARAMETER1> = stages
             .iter()
@@ -214,8 +241,11 @@ impl Host {
                     pParameters: params.as_ptr(),
                     NumStaticSamplers: samplers.len() as u32,
                     pStaticSamplers: samplers.as_ptr(),
-                    Flags: D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT
-                        | D3D12_ROOT_SIGNATURE_FLAG_CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED
+                    Flags: if compute {
+                        D3D12_ROOT_SIGNATURE_FLAG_NONE
+                    } else {
+                        D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT
+                    } | D3D12_ROOT_SIGNATURE_FLAG_CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED
                         | D3D12_ROOT_SIGNATURE_FLAG_SAMPLER_HEAP_DIRECTLY_INDEXED,
                 },
             },
@@ -240,7 +270,7 @@ impl Host {
         &self,
         cs: &HostShader,
     ) -> Result<(ID3D12RootSignature, ID3D12PipelineState), String> {
-        let root = self.root_signature_for(&[(cs, D3D12_SHADER_VISIBILITY_ALL)])?;
+        let root = self.root_signature_of(&[(cs, D3D12_SHADER_VISIBILITY_ALL)], true)?;
         let pso = self.compute_pipeline_with(&root, &cs.dxil)?;
         Ok((root, pso))
     }
