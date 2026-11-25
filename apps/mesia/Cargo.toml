@@ -1,0 +1,34 @@
+[package]
+name = "mesia"
+description = "Command-line front end: inspect, census, convert, run."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+mesia-core.workspace = true
+mesia-pe.workspace = true
+mesia-loader.workspace = true
+mesia-hle.workspace = true
+mesia-shader = { workspace = true, features = ["host"] }
+mesia-game.workspace = true
+anyhow.workspace = true
+blake3.workspace = true
+memchr.workspace = true
+clap.workspace = true
+walkdir.workspace = true
+
+[features]
+# Debug-level logs and the debugging switches (frame capture, stack dumps,
+# the host debug layer, scripted keys). Off in a plain release build.
+diagnostics = [
+    "mesia-core/diagnostics",
+    "mesia-hle/diagnostics",
+    "mesia-loader/diagnostics",
+    "mesia-shader/diagnostics",
+]
+
+[lints]
+workspace = true

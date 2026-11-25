@@ -1,0 +1,19 @@
+# Copy to `mesia.toml` (git-ignored) and point it at YOUR files.
+# Every path must be OUTSIDE the repository; the tools refuse otherwise.
+# Environment variables (shown below) take precedence over this file.
+# MESIA_CONFIG selects a different config file.
+
+[paths]
+# Your own dump of the title.     env: MESIA_GAME_DIR
+game_dir = 'D:\mesia-data\game'
+
+# Derived data. Default: %LOCALAPPDATA%\mesia\cache.   env: MESIA_CACHE_DIR
+# cache_dir = 'D:\mesia-data\cache'
+
+# What titles save (persistent local storage), kept apart from the cache.
+# Default: %LOCALAPPDATA%\mesia\data.   env: MESIA_DATA_DIR
+# data_dir = 'D:\mesia-data\data'
+
+# Other Xbox Series titles used to test platform-level code.
+# env: MESIA_TEST_TITLES (separated by ';')
+test_titles = []

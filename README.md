@@ -1,147 +1,63 @@
-# MESIA Unified
+# mesia
 
-[![License: CC-BY-4.0](https://img.shields.io/badge/license-CC--BY--4.0-blue)](LICENSE)
-[![Status: experimental research](https://img.shields.io/badge/status-experimental%20research-orange)](ROADMAP.md)
-[![Tests: 137 automated checks (private lab)](https://img.shields.io/badge/tests-137%20automated%20checks%20%28private%20lab%29-green)](docs/DEVELOPMENT_STATUS.md)
+**mesia** runs the Xbox Series build of the game natively on Windows PCs with
+NVIDIA graphics cards, from game files you supply yourself.
 
-**An experimental Xbox Series compatibility engine for Windows**, written in Rust on
-top of DirectX 12, with GFX10→DXIL shader translation. MESIA Unified is a
-personal spare-time research project studying how Xbox Series binaries could be
-loaded, their GPU command streams interpreted, and their shaders recompiled for
-PC hardware — as a single, unified engine.
+**This repository contains no game files or assets.** You need your own copy
+of the game. Not affiliated with or endorsed by its developer or publisher.
 
-> **Why does this exist?** Honestly — for fun. I'm a systems/graphics developer
-> with 5+ years of low-level work behind me, and one weekend I wondered whether
-> console-grade GPU work could be coaxed onto a plain PC D3D12 stack. What
-> started as a small "load a weird executable" experiment turned into PE
-> mapping, then a fence discipline problem, then a shader translator, then a
-> command-stream engine — the kind of project you start "for a weekend" and
-> find yourself still debugging barriers for, months later. It's a playground
-> for hard GPU problems, shared publicly in case the journey helps or
-> entertains anyone else.
+## Status (2026-11-25)
 
-> **This repository ships documentation only.** The engine source is developed in
-> a private lab and is not yet published — a license-compatibility review across
-> its third-party components is in progress. See the [FAQ](docs/FAQ.md) and the
-> [source status](#source-status) section below.
+Tested on Windows 11 with an **NVIDIA GeForce RTX 3050** (8 GB):
 
-**Français :** voir [README_FR.md](README_FR.md).
-
----
-
-## What this is — and what it is not
-
-MESIA Unified is **research infrastructure**, not a product and not an emulator
-you can download and play games on. Everything verified so far was verified on
-**hand-assembled synthetic fixtures built inside the lab — not on real titles**.
-
-- **Long-term ambition:** run *GTA VI* (Xbox Series build) on PC — the moonshot
-  that keeps the project interesting. Stated ambition only: nothing here runs,
-  boots, or renders that title or any other real game, and it may never get
-  there. The point is everything learned on the way.
-- **Today:** a unified engine skeleton with a PE loader, a D3D12 backend with
-  budgeted GPU memory, a persistent pipeline cache, a GFX10→DXIL shader
-  translation service, and a guest-command decode/guard/execute layer — each
-  stage individually verified on the lab's own fixtures.
-- **Not:** a crack, a port, or a redistribution. There are no game files, no
-  proprietary content, and no DRM circumvention anywhere in this project.
-  See [Legal status & disclaimer](#legal-status--disclaimer).
-
-## Engine at a glance
-
-Six crates, one engine — details in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md):
-
-| Crate | Role |
+| | |
 |---|---|
-| `mesia-loader` | PE loading: shared `PreparedImage` IR, manual mapper (VirtualAlloc + relocs + IAT + TLS), pluggable import resolvers, `LoadedImage` lifecycle |
-| `mesia-mem` | Host memory arenas, `FencePool` — budget + LRU residency arbitrated by GPU fence epochs |
-| `mesia-core` | Unified configuration, cross-engine `PeFacts` PE-comparison harness |
-| `mesia-gpu` | The single D3D12 backend: device/queue/fence epochs, `GpuAllocator` (real `Evict`/`MakeResident`), descriptor heaps with a null guard slot, dedup'd `PipelineLibrary` with a persistent `D3D12_CACHED_PIPELINE_STATE` cache + offline journal |
-| `mesia-shader` | GFX10→DXIL translator, guest container parsing (DXBC/DXIL/XDAT/XBCH/FSSM + `ISG1`/`OSG1` signature parts), wave64→host-width lowering, neutral `TranslatedShader` output types |
-| `mesia-command` | Guest command layer: `MESC` lab stream decoder → typed `GuestCommand` IR → `Recording` + `IndirectGuard` → executor emitting onto the shared D3D12 surfaces |
+| Boot, first-boot screens, intro, opening credits | works |
+| Prologue | playable from the cell to the boat chase: cell, cafeteria, robbery, police chase (wanted level, minimap), boat, binoculars |
+| Stability | 1 h 30 min+ in one session without a crash |
+| Frame rate | 1-3 fps in the world (the first run is slower while shaders translate; they are cached after that) |
+| Known problems | anything in shadow is black and bright scenes overexpose (the game's ray-traced lighting does not run yet); some blocky artifacts; boats sit low in the water |
 
-## Where it stands
+## Requirements
 
-Seven integration phases completed in the private lab, **137 automated tests green,
-0 warnings** on the lab hardware (NVIDIA RTX 3060 12 GB, Windows 11, 16 GB RAM).
-Full milestone text in [ROADMAP.md](ROADMAP.md) and
-[docs/DEVELOPMENT_STATUS.md](docs/DEVELOPMENT_STATUS.md). Highlights:
+- Windows 10/11 x64, a CPU with AVX2
+- A Direct3D 12 GPU with shader model 6.6 and mesh shaders (NVIDIA RTX 20 series or newer)
+- Rust (the version in `rust-toolchain.toml`)
+- Several GB of free Windows commit memory (raise the paging file if `crashes.log` reports error 1455)
 
-- **PE loader** — one unified image pipeline proven byte-parity against
-  independent reference loaders; TLS callbacks and `DllMain`/EXE entry
-  points run end-to-end on lab fixtures.
-- **D3D12 backend** — single device on an RTX 3060, fence-epoch deferred frees,
-  real `Evict`/`MakeResident` residency under a hard budget, descriptor heaps
-  hardened with a permanent null guard slot + null-fill.
-- **Persistent PSO cache** — per-PSO `D3D12_CACHED_PIPELINE_STATE` blobs,
-  hash-verified before the driver ever sees them, plus an offline journal that
-  rebuilds a warm cache without rerunning the workload.
-- **GFX10→DXIL translation** — compute dispatch verified by readback, including
-  a wave64 cross-lane OR-reduce lowered correctly onto a 32-lane host; a
-  translated VS+PS pair rendered a pixel-exact triangle (2016/4096 texels).
-- **Command translation** — `MESC` lab stream → decode → IR → indirect guard →
-  execute: decoded draws, dispatches, and GPU-produced indirect arguments all
-  verified; the U-16 indirect neutralization rule is GPU-verified.
+## Build
 
-*All results above were verified on synthetic fixtures, not real titles.*
+```powershell
+cargo build --release -p mesia
+```
 
-## How it's built: multi-agent development
+## Play
 
-Phases 5 and 6 were built by **teams of isolated sub-agents**: each agent worked
-in its own git worktree against a **frozen interface contract** published before
-work began, and an orchestrator integrated the results in a fixed order —
-touching the shared files itself. Phase 5: four worktrees, zero file conflicts.
-Phase 6: same model, GPU tests serialized through the orchestrator. The
-interface contracts are treated as lab artifacts (they survive in the reports)
-— a methodology worth noting for anyone coordinating parallel work on a tightly
-coupled Rust engine.
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\play.ps1 -Game "<your game folder>\<the game's exe>"
+```
 
-## Source status
+`scripts\play.ps1` keeps the shader cache and saves in folders you choose
+(`-Cache`, `-Data`) and presses no buttons for you. Controller: XInput pads
+(a DualShock/DualSense through DS4Windows works). With no pad connected the
+keyboard acts as one while the game window has focus.
 
-The engine source remains **private** pending a license-compatibility review
-across the third-party components it consumes — call it "license review in
-progress"; the lab will not distribute builds or code until it is resolved.
-This repository publishes the project's documentation, status reports, and
-roadmap under [CC-BY-4.0](LICENSE) in the meantime.
+## Faster settings (optional, off by default)
 
-## Join the MESIA Unified Development Team
+`MESIA_RELAY=2`, or `MESIA_LATE_WAIT=3 MESIA_WIDE_BACK=1` cut frame
+time on the test machines. Set them in PowerShell before running the script.
 
-The project is small, research-grade, and run by collaborators. We are looking
-for contributors with experience — or serious interest — in:
+## Debugging switches
 
-- **Rust** systems programming (unsafe code discipline, workspace design)
-- **DirectX 12** (command lists, root signatures, residency, `ExecuteIndirect`)
-- **GFX10 / DXIL shader translation** (ISA decoding, wave-size lowering, SM 6.x)
-- **GPU memory management** (budgets, eviction, fence-based lifetime tracking)
-- **Compatibility-layer systems** (PE loading, HLE/import binding, command IRs)
-- **Performance measurement** and **test engineering** on real hardware
-- **Documentation** (the repo you're reading now)
+| Switch | Effect |
+|---|---|
+| `MESIA_CAPTURE=<dir>` + `MESIA_CAPTURE_FRAMES=<list>` | save those frames as PNG (diagnostics build) |
+| `MESIA_KEYS=30:Enter,35:X` | press keys at those seconds (diagnostics build) |
+| `MESIA_D3D12_DRED=1` | on a GPU failure, report the commands in flight |
+| `MESIA_PIPELINE_WAIT_MS=24` | shorter per-frame wait for pipelines still being built |
 
-To apply, read [CONTRIBUTING.md](CONTRIBUTING.md) and open an issue using the
-**collaborator application** template (`.github/ISSUE_TEMPLATE/`), or start from
-the [issue tracker](https://github.com/MESIA-Unified/MESIA-Unified/issues).
+Diagnostics build: `cargo build --profile diag -p mesia --features diagnostics`
 
-## Documentation
+## License
 
-- [ROADMAP.md](ROADMAP.md) — what's done, what's exploring, what's planned
-- [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) — crate diagram, command & shader pipelines, safety rules
-- [docs/DEVELOPMENT_STATUS.md](docs/DEVELOPMENT_STATUS.md) — per-phase ledger: goals, results, limits
-- [docs/FAQ.md](docs/FAQ.md) — the honest answers first
-
-## Legal status & disclaimer
-
-MESIA Unified is an **unofficial personal research project**, built for fun in
-spare time. It is not
-affiliated with, sponsored by, or endorsed by Rockstar Games, Take-Two
-Interactive, Microsoft, or any other company. "Xbox", "Xbox Series", "GTA", and
-"GTA VI" are trademarks of their respective owners; references are for
-identification of research goals only.
-
-The project is **not a crack, not a port, and not a bypass**: it contains no
-game code, no game assets, no console firmware or SDK material, and implements
-no DRM circumvention. All development and verification uses clean-room,
-hand-assembled synthetic fixtures. Running a real title would require the
-user's own legally obtained files — and no real title is currently supported.
-
-Documentation in this repository is licensed under
-[Creative Commons Attribution 4.0 International (CC-BY-4.0)](LICENSE).
+GPL-3.0-or-later (see `LICENSE`). Based on MESIA (Marvisak) and mesia-fork (fxceless).

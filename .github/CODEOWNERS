@@ -1,7 +1,0 @@
-# CODEOWNERS — MESIA Unified (public documentation repository)
-#
-# Every path in this repository is owned by the project owner account.
-# The owner reviews all changes personally; nothing merges without
-# owner review. There are no other code owners.
-
-* @MESIA-Unified
