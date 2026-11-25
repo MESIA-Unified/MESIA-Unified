@@ -296,11 +296,19 @@ pub(crate) fn ready(
             (base, 0)
         }
     };
-    for (n, shadow) in m.copies.iter().enumerate().skip(made as usize) {
-        let (_, len) = shadow.span();
-        heap.raw_uav_at(base + 1 + n as u32, &shadow.buffer, 0, len);
+    {
+        // The run's slots live for the heap's life and are indexed by
+        // every in-flight flight that bound it: a 32-byte descriptor
+        // written under a flight can be read mid-write and hang the
+        // device. Settle the flights and hold submissions until the
+        // slots the run does not have yet are written.
+        let _submissions = (made < m.copies.len() as u32).then(crate::host::settle_and_hold).flatten();
+        for (n, shadow) in m.copies.iter().enumerate().skip(made as usize) {
+            let (_, len) = shadow.span();
+            heap.raw_uav_at(base + 1 + n as u32, &shadow.buffer, 0, len);
+        }
+        m.heaps.insert(key, (base, m.copies.len() as u32));
     }
-    m.heaps.insert(key, (base, m.copies.len() as u32));
     // Once per list, and for copies numbered since: the builder alone
     // dispatches hundreds of times a frame.
     // shortcut: a copy another list numbers meanwhile is brought up to date

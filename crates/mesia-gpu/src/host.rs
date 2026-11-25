@@ -2295,6 +2295,20 @@ pub(crate) fn settle_now(why: usize) {
     host.settle(&mut submitted, why);
 }
 
+/// [`settle_now`] and keeps submissions out until the guard is dropped:
+/// for writes to tables in-flight flights read (a descriptor an
+/// in-flight list's shader could catch mid-write hangs the device).
+/// `None` while the flights machinery is off.
+pub(crate) fn settle_and_hold() -> Option<std::sync::MutexGuard<'static, u64>> {
+    if !late() {
+        return None;
+    }
+    let host = host()?;
+    let mut submitted = host.submitted.lock().unwrap_or_else(|e| e.into_inner());
+    host.settle(&mut submitted, WHY_SYNC);
+    Some(submitted)
+}
+
 /// [`settle_now`] at a present, and for a fence the title blocks on.
 pub(crate) fn settle_for_present() {
     settle_now(WHY_SYNC);
