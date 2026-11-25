@@ -140,7 +140,9 @@ fn shader_slot<'a>(handle: u64) -> Option<(&'a Heap, u32)> {
 }
 
 /// Makes the host descriptor for what the title wrote at `handle`, if it
-/// is in a shader-visible heap.
+/// is in a shader-visible heap. While a submission is in the air the
+/// host write waits (`HostHeap::deferred`); a queue grown past its bound
+/// stands the writer until the card is caught up.
 #[cfg(windows)]
 fn mirror(handle: u64) {
     let Some((heap, index)) = shader_slot(handle) else {
@@ -153,6 +155,14 @@ fn mirror(handle: u64) {
             drop(pending);
             if let Some(host) = host {
                 host.mirror(index, handle, false);
+                if host.deferred_full() {
+                    // Under no lock of ours (`pending` dropped, the heaps
+                    // look-up done): stand for the card, then drain.
+                    host::DEFERRED_WRITES[1]
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    crate::host::settle_for_fence();
+                    host.flush_deferred();
+                }
             }
         }
     }
@@ -651,11 +661,29 @@ fn wait_for(resource: usize, handle: u64) {
     }
 }
 
+/// Makes the host-slot writes put off while submissions were in the air
+/// (`HostHeap::deferred`), if none is now: at the boundary before a
+/// submission is counted, under the submission lock (`make_waiting`), so
+/// the submission being counted meets them.
+#[cfg(windows)]
+fn flush_deferred() {
+    let heaps = SHADER_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
+    for &(_, _, heap) in heaps.iter() {
+        // SAFETY: registered heaps are live (removed when dropped).
+        if let Some(Some(host)) = unsafe { &*(heap as *const Heap) }.host.get() {
+            host.flush_deferred();
+        }
+    }
+}
+
 /// Makes the host slots that waited for a texture's host copy, for the
 /// textures made since the last call. Called before a submission runs, by
 /// the thread that submits: a slot is read when a list runs.
+/// Host writes put off while a submission was in the air land here
+/// first.
 #[cfg(windows)]
 pub(crate) fn make_waiting() {
+    flush_deferred();
     let made = std::mem::take(&mut *MADE_LATE.lock().unwrap_or_else(|e| e.into_inner()));
     for resource in made {
         let handles = WAITING

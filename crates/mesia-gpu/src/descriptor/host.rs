@@ -86,6 +86,44 @@ pub(crate) struct HostHeap {
     /// other memory there makes stale, and which to look at again when the
     /// runtime maps, unmaps or writes memory ([`remapped`]).
     placed: Mutex<Spans>,
+    /// Title-slot host writes put off while a submission is in the air:
+    /// a flight's shaders index this heap directly, so a slot rewritten
+    /// while they run can be read mid-rewrite, a torn descriptor that
+    /// faults. [`HostHeap::flush_deferred`] applies them at a boundary
+    /// with nothing in the air. Keyed by slot: a newer write stands in
+    /// for earlier ones.
+    deferred: Mutex<std::collections::BTreeMap<u32, Deferred>>,
+    /// How many writes `deferred` holds, read without the lock on the
+    /// hot path.
+    deferred_n: std::sync::atomic::AtomicU32,
+}
+
+/// A title-slot host write put off while a submission was in the air
+/// ([`HostHeap::deferred`]); applied at a boundary with nothing in the
+/// air.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum Deferred {
+    /// Mirror the slot's title record at `handle`: `true` if a draw's
+    /// mirror asked for it (buffer views are made only for draws).
+    Mirror(u64, bool),
+    /// A null view of the kind the slot's `made` key held (`unmake`);
+    /// the slot's `made` entry is already cleared.
+    Null(u64),
+}
+
+/// Writes put off past this many stand the writer until the card is
+/// caught up ([`HostHeap::deferred_full`]).
+const DEFERRED_MOST: usize = 1 << 16;
+
+/// Host-slot writes put off while a submission was in the air, and
+/// queues grown past [`DEFERRED_MOST`].
+pub(crate) static DEFERRED_WRITES: [std::sync::atomic::AtomicU64; 2] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
+/// Whether a submission may still be running on the card: a write to a
+/// shader-visible heap can then be read mid-write by its shaders.
+fn in_the_air() -> bool {
+    crate::host::in_air(crate::host::current_submission())
 }
 
 impl Drop for HostHeap {
@@ -656,6 +694,8 @@ impl HostHeap {
                 .map(|_| std::sync::atomic::AtomicU32::new(0))
                 .collect(),
             placed: Mutex::default(),
+            deferred: Mutex::default(),
+            deferred_n: std::sync::atomic::AtomicU32::new(0),
         };
         // A slot never written is undefined: shaders reading one (a slot
         // the title wrote in a way we do not know, or a table entry no
@@ -883,7 +923,9 @@ impl HostHeap {
     }
 
     /// Makes host slot `index` null again, as it is before its view is
-    /// made: a null view of the kind it held.
+    /// made: a null view of the kind it held. With a submission in the
+    /// air the heap write waits in `deferred` for a boundary with none;
+    /// the slot's `made` entry is cleared at once.
     fn unmake(&self, made: &mut [u64], index: u32) {
         let Some(key) = made.get_mut(index as usize).map(std::mem::take) else {
             return;
@@ -891,6 +933,20 @@ impl HostHeap {
         if key == 0 {
             return;
         }
+        if in_the_air() {
+            // Nulling the slot races a flight's reads of it; the write
+            // waits (`HostHeap::deferred`), the slot keeping what it
+            // shows until then.
+            self.defer(index, Deferred::Null(key));
+            return;
+        }
+        self.null_made(index, key);
+    }
+
+    /// [`HostHeap::unmake`]'s heap write, for a slot whose `made` entry
+    /// is already cleared: a null view of the kind `key`'s view is, and
+    /// the slot lets go of what it showed.
+    fn null_made(&self, index: u32, key: u64) {
         match view_at(key as u32, (key >> 32) as u32) {
             Some(view) => null_for(&view, self.cpu(index)),
             None => null_view(self.cpu(index)),
@@ -1251,10 +1307,83 @@ impl HostHeap {
         }
     }
 
+    /// Puts `op` for title slot `index` into `deferred`; a newer write
+    /// of a slot stands in for earlier ones (a draw's mirror staying a
+    /// draw's), so the queue stays within the heap's slot count.
+    fn defer(&self, index: u32, op: Deferred) {
+        let mut deferred = self.deferred.lock().unwrap_or_else(|e| e.into_inner());
+        if let (Some(&Deferred::Mirror(_, for_draw)), Deferred::Mirror(handle, draw)) =
+            (deferred.get(&index), op)
+        {
+            deferred.insert(index, Deferred::Mirror(handle, draw || for_draw));
+        } else {
+            deferred.insert(index, op);
+        }
+        self.deferred_n
+            .store(deferred.len() as u32, std::sync::atomic::Ordering::Relaxed);
+        DEFERRED_WRITES[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Whether more writes wait than [`DEFERRED_MOST`]: the caller may
+    /// want to stand until the card is caught up, then drain the queue
+    /// ([`HostHeap::flush_deferred`]) — under no lock of ours.
+    pub(crate) fn deferred_full(&self) -> bool {
+        self.deferred_n.load(std::sync::atomic::Ordering::Relaxed) as usize > DEFERRED_MOST
+    }
+
+    /// Makes the writes `deferred` holds, if no submission is in the
+    /// air: at the boundary before one is counted
+    /// (`crate::descriptor::make_waiting`, under the submission lock),
+    /// and where a writer found the queue full after standing for the
+    /// card.
+    pub(crate) fn flush_deferred(&self) {
+        if self.deferred_n.load(std::sync::atomic::Ordering::Relaxed) == 0 || in_the_air() {
+            return;
+        }
+        // `deferred_n` tracks the map's length, kept under its lock.
+        let all = {
+            let mut deferred = self.deferred.lock().unwrap_or_else(|e| e.into_inner());
+            let all = std::mem::take(&mut *deferred);
+            self.deferred_n
+                .store(0, std::sync::atomic::Ordering::Relaxed);
+            all
+        };
+        if all.is_empty() {
+            return;
+        }
+        let mut made = self.made.lock().unwrap_or_else(|e| e.into_inner());
+        let mut rest = all.into_iter();
+        while let Some((index, op)) = rest.next() {
+            if in_the_air() {
+                // A submission started mid-drain: this write and the rest
+                // wait again (a defer of the same slot made since is
+                // newer, and stands).
+                let mut deferred = self.deferred.lock().unwrap_or_else(|e| e.into_inner());
+                deferred.entry(index).or_insert(op);
+                for (index, op) in rest.by_ref() {
+                    deferred.entry(index).or_insert(op);
+                }
+                self.deferred_n
+                    .store(deferred.len() as u32, std::sync::atomic::Ordering::Relaxed);
+                return;
+            }
+            match op {
+                Deferred::Mirror(handle, for_draw) => {
+                    let _ = self.mirror_locked(&mut made, index, handle, for_draw);
+                }
+                Deferred::Null(key) => self.null_made(index, key),
+            }
+        }
+    }
+
     /// Makes host slot `index` from the record the title has at `handle`
     /// if it changed since, and returns the view recorded there. Buffer
     /// views are made only for draws (`for_draw`), which also copy their
     /// data: a host copy of a buffer is made on first use.
+    /// While a submission is in the air the write waits in `deferred`
+    /// (a flight's shaders may read the slot mid-rewrite — translated
+    /// shaders index the heap directly), and the caller still gets the
+    /// view: the slot goes on showing what it had, stale but whole.
     pub(crate) fn mirror(&self, index: u32, handle: u64, for_draw: bool) -> Option<View> {
         if index >= self.count {
             // Diagnostic (NVIDIA heap cap): the highest title slot past the
@@ -1270,11 +1399,30 @@ impl HostHeap {
             }
             return None;
         }
+        if in_the_air() {
+            self.defer(index, Deferred::Mirror(handle, for_draw));
+            return super::view(handle);
+        }
+        if self.deferred_n.load(std::sync::atomic::Ordering::Relaxed) > 0 {
+            // Idle again: writes that waited land first, then this one's.
+            self.flush_deferred();
+        }
+        let mut made = self.made.lock().unwrap_or_else(|e| e.into_inner());
+        self.mirror_locked(&mut made, index, handle, for_draw)
+    }
+
+    /// [`HostHeap::mirror`] with `made` held.
+    fn mirror_locked(
+        &self,
+        made: &mut [u64],
+        index: u32,
+        handle: u64,
+        for_draw: bool,
+    ) -> Option<View> {
         // SAFETY: the handle is a descriptor slot in title memory.
         let [tag, i, generation] = unsafe { (handle as *const [u32; 3]).read_unaligned() };
         // Generations start at 1, so a made slot's key is never 0.
         let key = u64::from(generation) << 32 | u64::from(i);
-        let mut made = self.made.lock().unwrap_or_else(|e| e.into_inner());
         let view = (tag == VIEW_TAG).then(|| view_at(i, generation)).flatten();
         let Some(view) = view else {
             // Not a view of ours (never written, or of a resource the
@@ -1295,7 +1443,7 @@ impl HostHeap {
             // let go of the host copies they held.
             for stale in self.note_buffer(index, Some(&view), for_draw) {
                 if stale != index {
-                    self.unmake(&mut made, stale);
+                    self.unmake(made, stale);
                 }
             }
             // A view of a texture object that has no host copy yet waits
