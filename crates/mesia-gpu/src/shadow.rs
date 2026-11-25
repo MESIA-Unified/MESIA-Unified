@@ -2619,7 +2619,11 @@ impl Shadow {
             for &(at, n) in &differing {
                 self.changed(at, at + n);
             }
-            let mut title = vec![0u8; PIECE];
+            // Title bytes for the merge, in reused memory and grown only:
+            // a fresh zeroed 64 KiB for every range cost some microseconds
+            // of clearing a call, most of it for nothing — `read_into`
+            // fills the buffer before the merge reads it.
+            let mut title = Vec::new();
             for (at, n) in differing {
                 // SAFETY: inside the mapping; only the submitting thread
                 // writes it.
@@ -2635,6 +2639,12 @@ impl Shadow {
                 let last = last_difference(host, old).unwrap_or(first);
                 let (at, n) = (at + first, last + 1 - first);
                 let (host, old) = (&mut host[first..=last], &old[first..=last]);
+                if title.len() < n {
+                    if title.capacity() < n {
+                        title = pooled(PIECE).unwrap_or_default();
+                    }
+                    title.resize(n, 0);
+                }
                 let title = &mut title[..n];
                 if !crate::host::read_into((start + at) as *const u8, title) {
                     continue;
@@ -2658,6 +2668,9 @@ impl Shadow {
                     crate::host::write_mapped((start + at) as *mut u8, title.as_ptr(), n);
                     written += n;
                 }
+            }
+            if title.capacity() > 0 {
+                give_back(title);
             }
             // Our write shows as a title write at the copy's next refresh,
             // which copies those pages once more (some dozens of MB a
@@ -2733,8 +2746,13 @@ impl Shadow {
         let last = last_difference(now, held).unwrap_or(first);
         let (at, n) = (at + first, last + 1 - first);
         let (now, held) = (&now[first..=last], &mut held[first..=last]);
-        title.clear();
-        title.resize(n, 0);
+        // Grown only: `read_into` fills the `n` bytes before the merge
+        // reads them, and clearing the scratch again for every piece was
+        // some microseconds a call most pieces did not need.
+        if title.len() < n {
+            title.resize(n, 0);
+        }
+        let title = &mut title[..n];
         // Title memory not there: looked at again when the next flight
         // that declared the range lands (the snapshot stays as it is).
         if !crate::host::read_into((start + at) as *const u8, title) {
@@ -2957,7 +2975,10 @@ impl Shadow {
             return true;
         }
         let base = start / PAGE;
-        let mut title = vec![0u8; PAGE];
+        // Title bytes of a stale page, for the compare: grown only, and
+        // only when a stale page is read (a fresh zeroed page every call
+        // was cleared for nothing — `read_into` fills it first).
+        let mut title = Vec::new();
         for (a, e) in busy {
             // As the refresh itself asks (`update_free`): the journal if
             // the submission's asking covered the range, else the kernel,
@@ -2982,6 +3003,9 @@ impl Shadow {
                     continue;
                 }
                 let n = hi - lo;
+                if title.len() < n {
+                    title.resize(n, 0);
+                }
                 let title = &mut title[..n];
                 // The lock of the copy's reference (the snapshot, or the
                 // CPU's side of a copy in the card's memory), from before
@@ -3262,8 +3286,13 @@ impl Shadow {
         let last = last_difference(gpu, old).unwrap_or(first);
         let (at, n) = (at + first, last + 1 - first);
         let (gpu, old) = (&gpu[first..=last], &mut old[first..=last]);
-        title.clear();
-        title.resize(n, 0);
+        // Grown only: `read_into` fills the `n` bytes before they are
+        // looked at, and clearing the scratch again for every piece was
+        // some microseconds a call most pieces did not need.
+        if title.len() < n {
+            title.resize(n, 0);
+        }
+        let title = &mut title[..n];
         let mut written = 0;
         if crate::host::read_into((start + at) as *const u8, title) {
             // As in `copy_back`: the card's byte where it is not what it
@@ -3339,17 +3368,30 @@ impl Shadow {
                 .filter(|&(a, b)| a < at + n && b > at)
                 .collect()
         };
-        title.clear();
-        title.resize(n, 0);
+        // Grown only: `read_into` fills the `n` bytes before the merge
+        // reads them, and clearing the scratch again for every piece was
+        // some microseconds a call most pieces did not need.
+        if title.len() < n {
+            title.resize(n, 0);
+        }
+        let title = &mut title[..n];
         let mapped = crate::host::read_into((start + at) as *const u8, title);
+        if !mapped {
+            // Title memory is not mapped there: the CPU's side keeps what
+            // the card wrote, as before (`merge_piece` on the scratch took
+            // the card's byte only where it differed — this is the same
+            // bytes without the walk).
+            for (a, b) in outside(at, at + n, skip) {
+                held[a - at..b - at].copy_from_slice(&gpu[a - at..b - at]);
+            }
+            return 0;
+        }
         let mut changed = false;
         for (a, b) in outside(at, at + n, skip) {
             let (a, b) = (a - at, b - at);
-            // Title memory that is not mapped: the CPU's side keeps what
-            // the card wrote, as before; `title` is scratch then.
             changed |= merge_piece(&gpu[a..b], &mut held[a..b], &mut title[a..b]);
         }
-        if !mapped || !changed {
+        if !changed {
             return 0;
         }
         crate::watch::writing(start + at, n);
@@ -4192,6 +4234,179 @@ mod refresh_tests {
         assert_eq!(shadow.update(start, len), len, "the whole range every time");
         assert_eq!(mirror(data, 0), Watched::pattern(0x10).as_slice());
         assert_eq!(mirror(data, 1), Watched::pattern(0x20).as_slice());
+    }
+}
+
+#[cfg(test)]
+mod copy_bench {
+    use super::{PIECE, give_back, merge_piece, outside, pooled};
+
+    // A u64-worded merge was measured against the byte loops above (200 ×
+    // 64 KiB, sparse and dense diffs): 0.7-1.1× their time — LLVM already
+    // vectorizes them, so no widened merge was landed. The waste was the
+    // work around the merges, benched below.
+
+    /// With title memory not mapped, [`Shadow::card_merge_relay`] keeps
+    /// the card's bytes on the CPU's side. The merge that ran on the
+    /// unread scratch then and the plain copy now must leave `held` the
+    /// same: [`merge_piece`] puts `now`'s byte only where it differs,
+    /// which is a copy of the same range — and that path threw the merge's
+    /// "changed" answer and scratch away anyway (its return is 0).
+    #[test]
+    fn an_unmapped_merge_is_a_plain_copy() {
+        for (n, skip) in [
+            (0usize, vec![]),
+            (8, vec![(2usize, 4usize)]),
+            (PIECE, vec![]),
+            (PIECE, vec![(100usize, 2000), (30_000, 40_000)]),
+            (PIECE, vec![(0usize, PIECE)]),
+            (PIECE, vec![(PIECE, PIECE + 7), (9, 9)]),
+        ] {
+            let gpu: Vec<u8> = (0..n).map(|i| (i as u32).wrapping_mul(31).wrapping_add(7) as u8).collect();
+            let held: Vec<u8> = (0..n).map(|i| (i as u32).wrapping_mul(17).wrapping_add(3) as u8).collect();
+            // Scratch holds stale bytes of an earlier call, not zeros —
+            // `held` must not depend on them either way.
+            let title: Vec<u8> = (0..n).map(|i| (i as u32).wrapping_mul(11).wrapping_add(5) as u8).collect();
+            let (mut merged_held, mut merged_title) = (held.clone(), title);
+            for (a, b) in outside(0, n, skip.clone()) {
+                merge_piece(&gpu[a..b], &mut merged_held[a..b], &mut merged_title[a..b]);
+            }
+            let mut copied_held = held.clone();
+            for (a, b) in outside(0, n, skip.clone()) {
+                copied_held[a..b].copy_from_slice(&gpu[a..b]);
+            }
+            assert_eq!(merged_held, copied_held, "n={n} skip={skip:?}");
+        }
+    }
+
+    /// The `vec![0u8; PIECE]` every `Shadow::copy_back` made vs the
+    /// pooled, grow-only scratch there now: 2000 calls of a few differing
+    /// pieces each, the shape `copy_back` has on a world frame.
+    /// `cargo test --release -p mesia-gpu -- --ignored --nocapture scratch`
+    #[test]
+    #[ignore = "benchmark"]
+    fn scratch_buffers() {
+        const CALLS: usize = 2000;
+        const PIECES: [usize; 3] = [4_096, 61_000, 8_000];
+        let mut sink = 0usize;
+        let clock = std::time::Instant::now();
+        for _ in 0..CALLS {
+            let mut title = vec![0u8; PIECE];
+            for &n in &PIECES {
+                let t = &mut title[..n];
+                t[0] ^= 1;
+                t[n - 1] ^= 1;
+                sink += t[0] as usize;
+            }
+        }
+        let fresh = clock.elapsed();
+        let clock = std::time::Instant::now();
+        for _ in 0..CALLS {
+            let mut title = Vec::new();
+            for &n in &PIECES {
+                if title.len() < n {
+                    if title.capacity() < n {
+                        title = pooled(PIECE).unwrap_or_default();
+                    }
+                    title.resize(n, 0);
+                }
+                let t = &mut title[..n];
+                t[0] ^= 1;
+                t[n - 1] ^= 1;
+                sink += t[0] as usize;
+            }
+            if title.capacity() > 0 {
+                give_back(title);
+            }
+        }
+        let grown = clock.elapsed();
+        println!(
+            "{CALLS} calls x {} pieces of <=64 KiB: vec![0; 64 KiB] a call {fresh:?}, pooled grow-only {grown:?} ({:.1}x) [{sink}]",
+            PIECES.len(),
+            fresh.as_secs_f64() / grown.as_secs_f64(),
+        );
+    }
+
+    /// The `title.clear(); title.resize(n, 0)` the merges ran per piece
+    /// vs the grow-only resize there now, over a caller's scratch reused
+    /// for thousands of pieces of up to 64 KiB.
+    /// `cargo test --release -p mesia-gpu -- --ignored --nocapture piece_scratch`
+    #[test]
+    #[ignore = "benchmark"]
+    fn piece_scratch() {
+        const CALLS: usize = 3000;
+        const PIECES: [usize; 4] = [PIECE, 3_000, 55_000, 40_000];
+        let mut sink = 0usize;
+        let mut title = Vec::new();
+        let clock = std::time::Instant::now();
+        for _ in 0..CALLS {
+            for &n in &PIECES {
+                title.clear();
+                title.resize(n, 0);
+                let t = std::hint::black_box(&mut title[..n]);
+                t[0] ^= 1;
+                sink += t[0] as usize;
+            }
+        }
+        let cleared = clock.elapsed();
+        let mut title = Vec::new();
+        let clock = std::time::Instant::now();
+        for _ in 0..CALLS {
+            for &n in &PIECES {
+                if title.len() < n {
+                    title.resize(n, 0);
+                }
+                let t = std::hint::black_box(&mut title[..n]);
+                t[0] ^= 1;
+                sink += t[0] as usize;
+            }
+        }
+        let grown = clock.elapsed();
+        println!(
+            "{CALLS} calls x {} pieces of <=64 KiB: clear+resize a piece {cleared:?}, grow-only {grown:?} ({:.1}x) [{sink}]",
+            PIECES.len(),
+            cleared.as_secs_f64() / grown.as_secs_f64(),
+        );
+    }
+
+    /// `Shadow::card_merge_relay` under unmapped title memory: the merge
+    /// it ran per in-range part on the unread scratch vs the copy it is
+    /// now.
+    /// `cargo test --release -p mesia-gpu -- --ignored --nocapture unmapped_merge`
+    #[test]
+    #[ignore = "benchmark"]
+    fn unmapped_merge() {
+        const ROUNDS: usize = 2000;
+        let n = PIECE;
+        let gpu: Vec<u8> = (0..n).map(|i| (i as u32).wrapping_mul(31).wrapping_add(7) as u8).collect();
+        let mut held = vec![0u8; n];
+        let mut title = vec![0u8; n];
+        let skip = vec![(1_000usize, 2_000), (30_000, 31_000)];
+        let mut sink = 0usize;
+        let clock = std::time::Instant::now();
+        for _ in 0..ROUNDS {
+            for (a, b) in outside(0, n, skip.clone()) {
+                sink += merge_piece(
+                    std::hint::black_box(&gpu[a..b]),
+                    std::hint::black_box(&mut held[a..b]),
+                    std::hint::black_box(&mut title[a..b]),
+                ) as usize;
+            }
+        }
+        let merged = clock.elapsed();
+        let clock = std::time::Instant::now();
+        for _ in 0..ROUNDS {
+            for (a, b) in outside(0, n, skip.clone()) {
+                std::hint::black_box(&mut held[a..b]).copy_from_slice(std::hint::black_box(&gpu[a..b]));
+                sink += held[a] as usize;
+            }
+        }
+        let copied = clock.elapsed();
+        println!(
+            "{ROUNDS} x 64 KiB with {} skipped ranges: merge on scratch {merged:?}, plain copy {copied:?} ({:.1}x) [{sink}]",
+            skip.len(),
+            merged.as_secs_f64() / copied.as_secs_f64(),
+        );
     }
 }
 
