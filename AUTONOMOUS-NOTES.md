@@ -132,7 +132,8 @@ Plan : baseline reproductible (Phase 1) → CPU (watch incrémental, relay_wait,
 - `MESIA_INPLACE` : stage 1 (windows) déjà actif ; **stage 2 (title buffers) interdit sous late_wait** (ranges déclarés inconnus pour buffers placés) — play.ps1 reste à 1 tant que LATE_WAIT≥1.
 - Autres : snapshot POOL 512 MB const, `fetched` jamais réduit, `kept` épingle toute ressource vue, `COPIES=1023` conservés toute la run.
 
-### En cours au moment du handoff
-- Test `LATE_WAIT=2` + `INPLACE=1` + `-Fast` sur le nouveau binaire : flights actifs en menu (« 3.0 sent ahead/frame »), 0 crash — **mais bloqué au sélecteur de profil** : l'injection `drive.ps1 key Enter` ne passe plus (focus Windows refusé). L'utilisateur doit appuyer Enter/A une fois ; ensuite surveiller le monde (<2 min = ancien temps de crash).
-- Si le monde tient >5 min sous LATE_WAIT=2 → monter à LATE_WAIT=3 puis RELAY=2 ; si le monde crash → dumper le nouveau breadcrumb et ré-analyser (résidu possible : écritures post-settle).
-- Mesurer frame-time + RAM sous INPLACE=1 ; si flights prouvés stables, `INPLACE=2` reste interdit (incompatible late_wait).
+### Résultat du test `016dddb` (LATE_WAIT=2 + INPLACE=1 + -Fast)
+- **Crash reproduit** : device removed ~23 s in-world, « 23 submissions sent ahead of 131 lists » — même signature qu'avant. Le gating `raw_uav_at` était nécessaire mais **pas suffisant** : un autre chemin d'écriture partagée sous flight existe. Dump conservé : `%TEMP%\crash_v5_1.txt` (479 pipelines dont 32 communs avec crash_2_relay).
+- Input autonome résolu : `scripts/enter.ps1` (clic réel sur la fenêtre → focus → keybd_event Enter). Le sélecteur de profil se passe seul maintenant.
+- Suspects suivants pour le même symptôme : (a) un second writer non-atomique sur état partagé (auditer tout `Create*View`/`copy_descriptors`/volatile >4B vers heap GPU-visible hors `defer`/`ready`), (b) la fenêtre résiduelle post-settle (soumission entre release du guard et enregistrement), (c) `strides`/staging races jugées « data-level » mais à revérifier côté DEVICE_HUNG réel, (d) épuisement/lifetime ressource à ~130 listes en vol (allocateurs, `late_most` listes=128 — coïncidence avec « 131 lists » ?).
+- Config stable livrée inchangée : `LATE_WAIT=0` + `-Fast` (+`INPLACE=2` possible puisque sync) → ~500 ms in-world, 0 crash.

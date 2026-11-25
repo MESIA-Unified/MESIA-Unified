@@ -16,14 +16,14 @@ $env:MESIA_CACHE_DIR = $Cache
 $env:MESIA_DATA_DIR = $Data
 # Relay disabled pending V4 crash bisect: three in-world device-removed with
 # MESIA_RELAY=2 + LATE_WAIT=3; the flights machinery stays on via LATE_WAIT=1.
-$env:MESIA_LATE_WAIT = "2"                # V5: flights fix test — was the fastest DEVICE_HUNG repro (~10s)
+$env:MESIA_LATE_WAIT = "0"                # flights still hang the device in-world (016dddb insufficient)
 $env:MESIA_WIDE_BACK = "1"
 $env:MESIA_PIPELINE_WAIT_MS = "24"
 $env:MESIA_CARD_BUFFERS_MIN_MB = "1"
 $env:MESIA_CARD_BUFFERS_MB = "3072"
 $env:MESIA_CARD_WINDOWS_MB = "2048"
 $env:MESIA_UNWATCHED_FRAMES = "1"
-$env:MESIA_INPLACE = "1"                  # windows in place; stage 2 (title buffers) banned with late wait
+$env:MESIA_INPLACE = "2"                  # title buffers in place too; requires LATE_WAIT=0
 $env:MESIA_WINDOW_KB = "1024"             # 1MiB windows for what cannot be placed (halves grid waste)
 $env:MESIA_TEXTURE_NO_WAIT = "1"
 $env:MESIA_JOIN_COPIES = "1"
