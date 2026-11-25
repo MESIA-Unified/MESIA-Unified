@@ -2748,16 +2748,24 @@ fn continues(last: (usize, usize, usize), next: (usize, usize, usize)) -> bool {
 /// One list's lock at a time: a submission may name a list twice.
 fn declared_writes(runs: &[&HostList]) -> Vec<Declared> {
     let mut back: Vec<Declared> = Vec::new();
+    if no_copies() {
+        // Nothing is copied back and no range is held
+        // (`MESIA_COPY_MODE=none`): collecting them feeds a pass that has
+        // nothing to do.
+        return back;
+    }
+    // Dispatches declare the same ranges thousands of times: each (copy,
+    // range) once, looked up in `back` only the first time.
+    let mut seen: std::collections::HashSet<(usize, usize, usize)> = std::collections::HashSet::new();
     for list in runs {
         for step in &list.deferred().copies {
             if let Step::GpuWrite(shadow, address, len) = step {
                 let range = (*address, *address + *len);
+                if !seen.insert((std::sync::Arc::as_ptr(shadow) as usize, range.0, range.1)) {
+                    continue;
+                }
                 match back.iter_mut().find(|(s, _)| std::sync::Arc::ptr_eq(s, shadow)) {
-                    Some((_, ranges)) => {
-                        if !ranges.contains(&range) {
-                            ranges.push(range);
-                        }
-                    }
+                    Some((_, ranges)) => ranges.push(range),
                     None => back.push((shadow.clone(), vec![range])),
                 }
             }
@@ -3111,20 +3119,27 @@ impl Host {
         if !crate::shadow::cards() {
             return None;
         }
+        if no_copies() {
+            // Nothing is copied back (`MESIA_COPY_MODE=none`): no compare
+            // runs, and nothing marks a range to send up (the refreshes
+            // that would are off as well).
+            return None;
+        }
         // The ranges this submission's shaders may write, per copy.
         let mut declared: Vec<(Arc<crate::shadow::Shadow>, Vec<(usize, usize)>)> = Vec::new();
+        // Each (copy, range) once, as in `declared_writes`.
+        let mut seen: std::collections::HashSet<(usize, usize, usize)> = std::collections::HashSet::new();
         for list in runs {
             for step in &list.deferred().copies {
                 if let Step::GpuWrite(shadow, address, len) = step
                     && shadow.carded()
                 {
                     let range = (*address, *address + *len);
+                    if !seen.insert((Arc::as_ptr(shadow) as usize, range.0, range.1)) {
+                        continue;
+                    }
                     match declared.iter_mut().find(|(s, _)| Arc::ptr_eq(s, shadow)) {
-                        Some((_, ranges)) => {
-                            if !ranges.contains(&range) {
-                                ranges.push(range);
-                            }
-                        }
+                        Some((_, ranges)) => ranges.push(range),
                         None => declared.push((shadow.clone(), vec![range])),
                     }
                 }
@@ -5525,7 +5540,7 @@ impl HostList {
         #[cfg(feature = "diagnostics")]
         use crate::copystat::{C, add};
         for step in &self.deferred().copies {
-            let started = std::time::Instant::now();
+            let mut started = std::time::Instant::now();
             let copied = match step {
                 &Step::Copy(dst, src, len) => {
                     #[cfg(feature = "diagnostics")]
@@ -5534,6 +5549,9 @@ impl HostList {
                         add(C::CopyBytes, len as u64);
                     }
                     batch.title_written();
+                    // The flush it ran is counted where it runs: the
+                    // step's own time starts after it.
+                    started = std::time::Instant::now();
                     copy_mapped(dst as *mut u8, src as *const u8, len, true);
                     // With the submission's one asking: the journal learns it.
                     crate::watch::wrote(dst, len);
@@ -5736,6 +5754,24 @@ impl Batch {
     }
 }
 
+/// How copies run: 0 guarded (as always), 1 plain (diagnostics builds), 2
+/// not at all (`MESIA_COPY_MODE`).
+fn copy_mode() -> u8 {
+    static MODE: OnceLock<u8> = OnceLock::new();
+    *MODE.get_or_init(|| match std::env::var("MESIA_COPY_MODE").as_deref() {
+        Ok("plain") => 1,
+        Ok("none") => 2,
+        _ => 0,
+    })
+}
+
+/// Whether copies of title memory are skipped (`MESIA_COPY_MODE=none`):
+/// refreshes only ask the write watch (the copies are not made), and
+/// nothing goes back — no snapshots, compares, fetches or merges.
+pub(crate) fn no_copies() -> bool {
+    copy_mode() == 2
+}
+
 /// Copies title memory at submission. The ranges were checked against their
 /// resources when recorded, but the title may since have unmapped pages of
 /// them (tiled memory, page mappings), which read as zeros here; a title
@@ -5746,10 +5782,11 @@ impl Batch {
 /// cost about 2 ms per copy in the title's big pools (it walks the page
 /// tables to the region's end), which made copies run at 100-200 MB/s.
 pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: bool) {
-    #[cfg(feature = "diagnostics")]
-    match crate::copystat::mode() {
+    match copy_mode() {
+        #[cfg(feature = "diagnostics")]
         1 => {
-            // SAFETY: timing only: the caller vouches for the source.
+            // SAFETY: timing only: the caller vouches for the source. Not
+            // checked as `read` checks it: diagnostics builds only.
             unsafe { std::ptr::copy(src, dst, len) };
             return;
         }

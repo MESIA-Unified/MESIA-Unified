@@ -191,8 +191,11 @@ pub(crate) fn ask_once(ranges: &[(usize, usize)]) {
             continue;
         }
         let (first, last) = (start / PAGE, end.div_ceil(PAGE));
-        if !j.ahead.iter().any(|&(a, b)| a <= first && last <= b) && ask_kernel(j, first, last) {
-            j.ahead.push((first, last));
+        if !j.ahead.iter().any(|&(a, b)| a <= first && last <= b) {
+            let now = j.ahead_asked;
+            if ask_kernel(j, first, last, now) {
+                j.ahead.push((first, last));
+            }
         }
     }
     j.kept = !j.ahead.is_empty();
@@ -232,7 +235,8 @@ fn ask_run(j: &mut Journal, pieces: &[(usize, usize)]) {
     }
     let first = pieces[0].0;
     let last = pieces.iter().map(|p| p.1).max().unwrap_or(first);
-    if ask_kernel(j, first, last) {
+    let now = j.ahead_asked;
+    if ask_kernel(j, first, last, now) {
         j.ahead.push((first, last));
         return;
     }
@@ -242,9 +246,9 @@ fn ask_run(j: &mut Journal, pieces: &[(usize, usize)]) {
 }
 
 /// Asks the kernel for the written pages of pages `[first, last)` and notes
-/// them in the journal under the ahead asking; false (and nothing changed)
+/// them in the journal under the asking `now`; false (and nothing changed)
 /// if the range is not write-watched memory of one reservation.
-fn ask_kernel(j: &mut Journal, first: usize, last: usize) -> bool {
+fn ask_kernel(j: &mut Journal, first: usize, last: usize, now: u64) -> bool {
     use windows_sys::Win32::System::Memory::GetWriteWatch;
     const WRITE_WATCH_FLAG_RESET: u32 = 1;
     let mut count = (last - first) * PAGE / KERNEL_PAGE;
@@ -273,7 +277,6 @@ fn ask_kernel(j: &mut Journal, first: usize, last: usize) -> bool {
         add(C::WatchUs, started.elapsed().as_micros() as u64);
         slow(started.elapsed().as_micros() as u64);
     }
-    let now = j.ahead_asked;
     for k in 0..count {
         let page = j.found[k] / PAGE;
         j.written.insert(page, now);
@@ -372,6 +375,29 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
             .map(|(&p, &w)| (p, w))
             .collect(),
     ))
+}
+
+/// Whether `[start, end)` is write-watched memory: the asking's number, as
+/// [`writes`] would give it, but with no written pages collected — for a
+/// caller that asks only whether the memory is watched at all (a refresh
+/// that copies nothing). `None` where the kernel would say it is not
+/// (view memory included: nothing is guarded for a copy never made).
+pub(crate) fn probed(start: usize, end: usize) -> Option<u64> {
+    let (first, last) = (start / PAGE, end.div_ceil(PAGE));
+    let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
+    let j = &mut *j;
+    // Asked ahead with the submission's other ranges: the journal has it.
+    if j.ahead.iter().any(|&(a, b)| a <= first && last <= b) {
+        return Some(j.ahead_asked);
+    }
+    // Numbered as `writes` numbers a kernel asking: written pages the
+    // kernel reports are noted under it (they are not collected here).
+    let now = j.asked + 1;
+    if !ask_kernel(j, first, last, now) {
+        return None;
+    }
+    j.asked = now;
+    Some(now)
 }
 
 /// Guarded blocks of view memory.

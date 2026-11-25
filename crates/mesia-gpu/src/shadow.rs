@@ -1048,7 +1048,10 @@ fn workers() -> &'static Workers {
         more: std::sync::Condvar::new(),
     });
     STARTED.call_once(|| {
-        let n = std::thread::available_parallelism().map_or(4, |n| n.get() / 4).clamp(2, 6);
+        // The copies and compares the submitting thread waits on: half
+        // the machine's threads (a few at least) leaves the title's own
+        // threads room.
+        let n = std::thread::available_parallelism().map_or(4, |n| (n.get() / 2).clamp(4, 10));
         for i in 0..n {
             let _ = std::thread::Builder::new().name(format!("mesia-wide-{i}")).spawn(move || {
                 let workers = WORKERS.get().expect("made above");
@@ -2464,6 +2467,12 @@ impl Shadow {
         if self.place.is_some() {
             return;
         }
+        if crate::host::no_copies() {
+            // Nothing is copied back (`MESIA_COPY_MODE=none`): no snapshot
+            // is taken and no range is held for one, so nothing waits on
+            // them either.
+            return;
+        }
         let range = (address, address + len);
         let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
         // With the copy-back on its own thread: counted for this submission
@@ -3115,6 +3124,23 @@ impl Shadow {
     /// [`Shadow::update`] of `[from, to)` (inside the buffer) where no
     /// shader writes.
     fn update_free(&self, from: usize, to: usize) -> usize {
+        if crate::host::no_copies() {
+            // `MESIA_COPY_MODE=none`: nothing is copied. The asking only
+            // keeps the flag that says whether this memory is
+            // write-watched — what is not stays out of the ahead askings
+            // (a range that is not watched costs the asking every flush).
+            if self.watched.load(Ordering::Relaxed) != NOT_WATCHED {
+                self.watched.store(
+                    if crate::watch::probed(from, to).is_some() {
+                        1
+                    } else {
+                        NOT_WATCHED
+                    },
+                    Ordering::Relaxed,
+                );
+            }
+            return 0;
+        }
         if self.watched.load(Ordering::Relaxed) != NOT_WATCHED {
             if let Some((now, written)) = crate::watch::writes(from, to, true) {
                 self.watched.store(1, Ordering::Relaxed);
