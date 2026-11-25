@@ -16,7 +16,7 @@ $env:MESIA_CACHE_DIR = $Cache
 $env:MESIA_DATA_DIR = $Data
 # Relay disabled pending V4 crash bisect: three in-world device-removed with
 # MESIA_RELAY=2 + LATE_WAIT=3; the flights machinery stays on via LATE_WAIT=1.
-$env:MESIA_LATE_WAIT = "2"
+$env:MESIA_LATE_WAIT = "0"
 $env:MESIA_WIDE_BACK = "1"
 $env:MESIA_PIPELINE_WAIT_MS = "24"
 $env:MESIA_CARD_BUFFERS_MIN_MB = "1"

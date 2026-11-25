@@ -93,3 +93,29 @@ Correct : `abort` doit sauter à `out` (sortie du header `t`) **avec les phis re
 
 ## Campagne V4 (reçue) — perf recovery 3-5 fps
 Plan : baseline reproductible (Phase 1) → CPU (watch incrémental, relay_wait, binding) → GPU/shaders → cache → paliers 500/333/250/200 ms → endurance. Handoff : HANDOFF-FPS.md. Ordre d'exécution fixé : mesure → goulot #1 → re-mesure → #2 → #3 → GPU.
+
+## 2026-11-25 — campagne V4, vague 1
+
+### Mesures (frame in-world, nouveau binaire 19:58)
+- ~837 ms/frame, ~4500 draws ; carte ~48-51 % occupée, ~600 ms/frame de travail CPU pendant que le GPU attend derrière.
+- `preparing: copies` ~237-360 ms ; `copying back` ~109-173 ms ; ~380 hash passes / ~2400 pièces + ~89 compare passes / ~17 000 pièces par frame.
+- Le split GPU : ~90-95 % = le rendu du titre lui-même (shaders traduits), ~25-45 ms = notre overhead (dispatches hash/compare, copies, readbacks). Source : audit agent C (rapport dans l'historique de session).
+
+### Crash DEVICE_HUNG (0x887A0006) — bisection (corrigé après 5e crash)
+- Le breadcrumb applicatif (21a93e2) a FONCTIONNÉ : dump des listes en vol + pipelines nommés aux crashs. Blocs dans %TEMP%\crash_20533.txt et crash_2_relay.txt.
+- 5 crashs reproduits, tous in-world, tous avec soumissions en vol (« sent ahead of N lists »).
+- **Tout mode flight finit par crasher** : `LATE_WAIT=1` a tenu ~5,5 min une fois (chance) puis a crashé en ~1,5 min ; `LATE_WAIT=2` crash en ~10 s ; `LATE_WAIT=3` ~40 s ; `RELAY=2` ~10-60 s. Seul le drain synchrone (`LATE_WAIT=0` ou GPU_TIMING) est stable (soak 18 min + runs répétées).
+- Le bug est donc dans la mécanique flights elle-même (n'importe quel stage ≥1), pas spécifiquement relay/late_free_present. Piste principale : écritures descripteurs non couvertes par le gating 176b425 pendant les vols ; vie des ressources soumises en vol.
+- Config livrée : **`LATE_WAIT=0` + `-Fast`** (play.ps1) → ~600 ms/frame in-world, 0 crash, rendu correct vérifié.
+
+### Changements V4 intégrés (commits)
+- `444839b` COPY_MODE=none rendu réel (était dead code en release) + pool wide 4-10 + dédup declared_writes/card_before.
+- `a201f1a` caches epoch `Shown` dans descriptors, dédup defer/gpu_wrote, IASet skips, Weak VB/IB — ~15-45 ms/frame estimés.
+- `985daf4` **correctif sémantique no_copies** : « none » = no copy-BACKS seulement ; uploads titre→shadow→GPU restaurés (update_free copie, copy_mapped memcpy, card_before garde dirty sends). Sans ce fix : écran noir à ~5000 draws (shaders lisaient des zéros). writing() reste court-circuité → pas de snapshots → back() no-op via declared_writes vide. watch::probed supprimé (orphelin).
+- 127 tests mesia-gpu verts.
+
+### À faire ensuite
+- **Fixer le bug flights** (cause profonde : gating descripteur 176b425 incomplet ? vie ressources en vol ?) — c'est le gros gain restant : flights ramenaient ~700 ms vs 600 sync ET le présent parallèle. Repro fiable : n'importe quel LATE_WAIT≥1, in-world, crash <2 min.
+- Mesurer le gain réel des commits A+B en synchrone propre (baseline 837 → ~600 ms observé, mais scènes différentes — refaire une mesure même scène).
+- Candidats GPU agent C : barrières superflues shaders traduits (UAV fence global par s_barrier — 50-150 ms estimés), hash-on-CPU pendant upload, batch compares, coalescing ranges upload.
+- Caveat `no_copies` : écrits shader→mémoire titre jamais rapatriés — OK perf, pas correct pour gameplay (animation/visibilité GPU→CPU figées). Durable : copy-back « cheap but correct » (items C 2-6).
