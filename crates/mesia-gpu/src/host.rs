@@ -193,6 +193,43 @@ pub(crate) fn in_air(submission: u64) -> bool {
     submission > FINISHED.load(Ordering::Acquire)
 }
 
+/// The layer's own breadcrumb for a removed device, by submission number:
+/// for each submission sent, what each of its lists had bound and was last
+/// asked to do ([`Crumb`]). The driver's own breadcrumb
+/// ([`Host::removal_data`], `MESIA_D3D12_DRED`) is unsupported on some
+/// cards (0x887A0004 from the query), which leaves a removal with nothing
+/// naming what ran: [`log_in_flight`] says these for the submissions not
+/// known finished when the device goes. An entry is dropped once the
+/// submission is confirmed finished ([`FINISHED`]) — lazily, when the next
+/// submission is recorded, so the submission being waited for is still
+/// here if the wait finds the device gone — and at most the last
+/// [`FLYING_MOST`] are kept.
+static FLYING: Mutex<std::collections::BTreeMap<u64, Vec<Crumb>>> =
+    Mutex::new(std::collections::BTreeMap::new());
+/// The most submissions kept in [`FLYING`].
+const FLYING_MOST: usize = 32;
+/// The most commands kept per list in [`FLYING`].
+const CRUMB_LAST: usize = 8;
+
+/// One list's breadcrumb ([`FLYING`]): what identifies it and what it last
+/// did, snapshotted when it was sent.
+struct Crumb {
+    /// Its place among the submission's lists.
+    index: usize,
+    /// Its command list, as the removal data's nodes name them.
+    raw: usize,
+    /// The pipelines it bound (their names are their shaders' hashes).
+    pipelines: Vec<String>,
+    /// Its last commands, oldest first: the noted commands (diagnostics
+    /// builds with `MESIA_D3D12_DRED`, the texts `HostList::note` keeps —
+    /// the same strings the slow-list dump prints) or, that being off, the
+    /// last of its submission-time steps ([`step_text`]).
+    last: Vec<String>,
+    /// The bottom-of-pipe writes and read-backs it left for after its run.
+    writes: usize,
+    backs: usize,
+}
+
 /// Objects [`retire`] dropped at once (no submission was running) and
 /// kept until a running submission finished, since the start.
 static RETIREMENTS: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
@@ -291,6 +328,30 @@ pub(crate) fn log_removal_context() {
         return;
     }
     tracing::error!("when the host device went: {}", removal_context());
+}
+
+/// Says [`FLYING`] in the log, one line per list sent and not known
+/// finished when the device went: the layer's own breadcrumb
+/// ([`fail`] calls it once it has named the removal).
+fn log_in_flight() {
+    let flying = FLYING.lock().unwrap_or_else(|e| e.into_inner());
+    if flying.is_empty() {
+        tracing::error!("in-flight lists: none recorded");
+        return;
+    }
+    for (submission, lists) in flying.iter() {
+        for c in lists {
+            tracing::error!(
+                "in-flight list {} of submission {submission} (list {:#x}): pipelines {:?}, {} writes and {} read-backs after its run, its last: {}",
+                c.index,
+                c.raw,
+                c.pipelines,
+                c.writes,
+                c.backs,
+                c.last.join("; ")
+            );
+        }
+    }
 }
 
 /// Time spent in submissions since the last frame-rate line, in
@@ -465,12 +526,15 @@ pub fn on_failure(report: fn(&str) -> !) {
 
 /// Ends the run on a host GPU failure: what failed, the removal reason and
 /// the debug layer's first error, if any (`MESIA_D3D12_DEBUG=1` in a
-/// diagnostics build names the command).
+/// diagnostics build names the command). A removal also says the layer's
+/// own breadcrumb of the lists in the air ([`log_in_flight`]).
 pub(crate) fn fail(what: std::fmt::Arguments) -> ! {
     let mut text = what.to_string();
+    let mut removed = false;
     if let Some(host) = host() {
         // SAFETY: a plain query.
         if let Err(e) = unsafe { host.device.GetDeviceRemovedReason() } {
+            removed = true;
             text.push_str(&format!("; device removed: {e}"));
             log_removal_context();
         }
@@ -483,6 +547,11 @@ pub(crate) fn fail(what: std::fmt::Arguments) -> ! {
         }
     }
     tracing::error!("{text}");
+    // The layer's own breadcrumb of the lists in the air when the device
+    // went: the driver's may name nothing (unsupported on some cards).
+    if removed {
+        log_in_flight();
+    }
     // Tests have no log: the reason goes to their output.
     #[cfg(test)]
     eprintln!("host GPU failure: {text}");
@@ -4229,6 +4298,22 @@ impl Host {
         if let Some(check) = card.as_ref().and_then(|c| c.check.clone()) {
             lists.push(Some(check));
         }
+        // The breadcrumb of this submission, said for the lists still in
+        // the air if the device goes ([`FLYING`]); submissions confirmed
+        // finished are dropped here, so what is kept is what the card may
+        // still run.
+        {
+            let done = FINISHED.load(Ordering::Acquire);
+            let mut flying = FLYING.lock().unwrap_or_else(|e| e.into_inner());
+            flying.retain(|&n, _| n > done);
+            while flying.len() >= FLYING_MOST {
+                let _ = flying.pop_first();
+            }
+            let _ = flying.insert(
+                this_submission,
+                runs.iter().enumerate().map(|(i, l)| l.crumb(i)).collect(),
+            );
+        }
         let prepared = std::time::Instant::now();
         if late {
             *submitted += 1;
@@ -5098,6 +5183,53 @@ impl HostList {
         let mut pipelines = self.pipelines.lock().unwrap_or_else(|e| e.into_inner());
         if !pipelines.contains(name) {
             pipelines.insert(name.to_owned());
+        }
+    }
+
+    /// The list's breadcrumb ([`FLYING`]), snapshotted at its submission:
+    /// what identifies it and what it last did.
+    fn crumb(&self, index: usize) -> Crumb {
+        // The texts the commands were noted with (diagnostics builds with
+        // `MESIA_D3D12_DRED`): the same strings the slow-list dump prints.
+        #[cfg(feature = "diagnostics")]
+        let noted: Vec<String> = self
+            .notes
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .rev()
+            .take(CRUMB_LAST)
+            .rev()
+            .map(|(n, _)| n.clone())
+            .collect();
+        #[cfg(not(feature = "diagnostics"))]
+        let noted: Vec<String> = Vec::new();
+        let deferred = self.deferred();
+        let last = if noted.is_empty() {
+            deferred
+                .copies
+                .iter()
+                .rev()
+                .take(CRUMB_LAST)
+                .rev()
+                .map(step_text)
+                .collect()
+        } else {
+            noted
+        };
+        Crumb {
+            index,
+            raw: self.list.as_raw() as usize,
+            pipelines: self
+                .pipelines
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .iter()
+                .cloned()
+                .collect(),
+            last,
+            writes: deferred.writes.len(),
+            backs: deferred.backs.len(),
         }
     }
 
@@ -6432,6 +6564,28 @@ impl Host {
                 None
             }
         }
+    }
+}
+
+/// A submission-time step as a crumb's command ([`FLYING`]), for lists
+/// whose commands were not noted.
+fn step_text(step: &Step) -> String {
+    match step {
+        &Step::Copy(dst, src, len) => {
+            format!("copy {len} bytes from {src:#x} to title memory {dst:#x}")
+        }
+        &Step::Fill(dst, src, len) => {
+            format!("copy {len} bytes from title memory {src:#x} to upload memory {dst:#x}")
+        }
+        Step::Refresh(_, address, len) => {
+            format!("refresh a buffer's host copy at {address:#x}+{len:#x}")
+        }
+        Step::Run(_) => "a submission-time step that may write title memory".to_owned(),
+        Step::Host(_) => "a submission-time step on host memory".to_owned(),
+        Step::GpuWrite(_, address, len) => {
+            format!("shaders may write a host copy at {address:#x}+{len:#x}")
+        }
+        Step::Texture(_) => "refresh a texture's staging buffer".to_owned(),
     }
 }
 
