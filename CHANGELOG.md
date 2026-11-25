@@ -26,7 +26,9 @@
 - Attribution line corrupted by the rename (`VIctory`/`victory-fork`).
 
 ### Added
-- `MESIA_WIDE_MERGE=1` — parallel copy-back merges (O1), off by default.
+- `MESIA_WIDE_MERGE=1` — parallel copy-back merges (O1), off by default;
+  synthetic benchmark shows 1.7× with byte-identical output
+  (`heavy_frames_of_merges_run_wide_and_merge_the_same`).
 - Test: fixed-base reservation write-watch tracking (xmem).
 - Docs: `test-inventory.md`, `memory-coherency.md`, `d3d12-validation.md`,
   `concurrency-validation.md`, `testing.md`, `benchmarks.md`,

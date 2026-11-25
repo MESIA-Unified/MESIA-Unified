@@ -63,3 +63,30 @@ See table above for measured state. Key findings:
 - **Critical path** in world scenes: sequential relay work — copy-back ~420 ms + copies ~250 ms + GPU wait ~220 ms ≈ 670 ms/frame. GPU only 49–63 % busy → CPU-side host work is the bottleneck.
 - **Proposed work**, highest impact first: O1 multithreaded copy-back (`shadow.rs`/relay), O2 batch small uploads into one staging buffer, O3 pipeline the card-side compares, O4 fix >1M view-heap slots (null textures), O5 pipeline prewarm, O6 chase the 0x80070057 refused compute pipelines.
 - Each item ships alone, measured on the same 250 s run, with zero-crash / zero-regression gates.
+
+---
+
+## Résultats O1 — benchmark synthétique (`a9155a0`+, mesuré 2026-11-25)
+
+`heavy_frames_of_merges_run_wide_and_merge_the_same` (ignoré, benchmark) —
+`cargo test -p mesia-gpu --release -- --ignored --nocapture heavy`.
+Machine : Windows 11, RTX 3060, 16 Go RAM.
+
+Charge : 6 frames × 72 copies (8 « windows » dans la plage d'une autre
+copie), 7 752 pièces, **484 MiB fetched/frame**, 64 groupes — modèle
+fidèle de `card_back` (mêmes fonctions de découpe/groupage/merge).
+
+| | Total | /frame |
+|---|---|---|
+| Pièce par pièce | 2,605 s | ~434 ms |
+| Threads `wide` | 1,542 s | ~257 ms |
+
+**Speedup 1,7×** — et **sortie octet-par-octet identique** (mémoire titre,
+sides CPU, compteurs d'écriture par range : assertions du test).
+Note : le modèle couvre le merge CPU ; le chemin réel ajoute les appels
+kernel (`NtWriteVirtualMemory`) dont la latence se parallélise aussi — le
+gain en jeu reste à mesurer. ~434 ms/frame séquentiel recoupe le ~420 ms
+de copy-back mesuré en monde (run 92).
+
+Statut : flag `MESIA_WIDE_MERGE` toujours **off** par défaut — bascule
+par défaut conditionnée à une run réelle A/B sans crash.

@@ -1333,7 +1333,9 @@ pub(crate) fn back_line(frames: f64) {
 
 #[cfg(test)]
 mod wide_tests {
-    use super::{Job, PIECE, WIDE_JOB, copy_jobs, find_pieces, merge_groups, wide};
+    use super::{
+        Job, PIECE, WIDE_JOB, card_piece_of, card_span_of, copy_jobs, find_pieces, first_difference, last_difference, merge_groups, wide,
+    };
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -1435,6 +1437,213 @@ mod wide_tests {
         );
         // Touching ends do not overlap ([0,10) and [10,20) are apart).
         assert_eq!(merge_groups(&[(1, 0, 10), (2, 10, 20)]), vec![vec![0], vec![1]]);
+    }
+
+    /// `Shadow::card_merge` on plain memory (a copy of ours needs a
+    /// device): `gpu` the fetched bytes of a piece the compare found
+    /// differing, `old` the CPU's side at the piece's offsets, `title`
+    /// the title bytes the piece covers, read into `scratch` and put
+    /// back where changed. The bytes written to title memory.
+    fn card_merge(gpu: &[u8], old: &mut [u8], title: &mut [u8], scratch: &mut Vec<u8>) -> usize {
+        let Some(first) = first_difference(gpu, old) else {
+            return 0;
+        };
+        let last = last_difference(gpu, old).unwrap_or(first);
+        let (gpu, old, title) = (&gpu[first..=last], &mut old[first..=last], &mut title[first..=last]);
+        scratch.clear();
+        scratch.extend_from_slice(title);
+        let mut differs = 0u8;
+        for ((t, g), o) in scratch.iter_mut().zip(gpu).zip(old.iter_mut()) {
+            let wrote = if *g != *o { 0xffu8 } else { 0 };
+            let merged = (*t & !wrote) | (*g & wrote);
+            differs |= merged ^ *t;
+            *t = merged;
+            *o = merged;
+        }
+        if differs == 0 {
+            return 0;
+        }
+        title.copy_from_slice(scratch);
+        gpu.len()
+    }
+
+    /// The card-back merges of heavy frames — dozens of copies'
+    /// differing pieces, a few of them of copies whose declared ranges
+    /// meet another's in title memory — merged on the kept threads
+    /// (`MESIA_WIDE_MERGE`) leave the title's and the sides' bytes
+    /// merging piece by piece leaves, in less wall time. Plain memory
+    /// stands in for the fetched bytes, the CPU sides and title memory;
+    /// the piece cutting, the grouping and the jobs are `card_back`'s.
+    /// Run with
+    /// `cargo test --release -p mesia-gpu -- --ignored --nocapture heavy`.
+    #[test]
+    #[ignore = "benchmark"]
+    fn heavy_frames_of_merges_run_wide_and_merge_the_same() {
+        // The copies: a start in title memory, a CPU side of `len`
+        // bytes, ranges a submission declared written. The "windows" are
+        // small copies inside a big copy's second range: their merges
+        // must keep the list's order, so `merge_groups` gives them one
+        // job with the copy's. A frame's fetched bytes are the same
+        // pieces every time; a later frame's merge still finds work,
+        // the side having taken the merged bytes of the frame before.
+        const FRAMES: usize = 6;
+        const COPIES: usize = 64;
+        const LEN: usize = 8 << 20;
+        const PITCH: usize = 9 << 20;
+        const WINDOWS: usize = 8;
+        const WLEN: usize = 1 << 20;
+        /// Declared `[from, to)` of a big copy.
+        const RANGES: [(usize, usize); 2] = [(256 << 10, LEN / 2), (LEN / 2 + PIECE, LEN - (256 << 10))];
+        // A copy's byte pattern (its side's bytes as made).
+        let pat = |c: usize, i: usize| (i as u32).wrapping_mul(31).wrapping_add((c * 7 + 3) as u32) as u8;
+        let mut starts = Vec::new();
+        let mut lens = Vec::new();
+        for c in 0..COPIES + WINDOWS {
+            if c < COPIES {
+                starts.push(c * PITCH);
+                lens.push(LEN);
+            } else {
+                let host = (c - COPIES) * (COPIES / WINDOWS);
+                starts.push(host * PITCH + RANGES[1].0 + 0x1000);
+                lens.push(WLEN);
+            }
+        }
+        // `ranges` (copy, declared title range) as `CardRange` gives
+        // them; `pieces` (range, copy, copy's start, lo, hi, at in
+        // `fetched`) as `card_back` cuts them out of the spans.
+        let mut ranges: Vec<(usize, usize, usize)> = Vec::new();
+        let mut pieces: Vec<(usize, usize, usize, usize, usize, usize)> = Vec::new();
+        let mut fetched_len = 0usize;
+        for c in 0..COPIES + WINDOWS {
+            let (start, len) = (starts[c], lens[c]);
+            let declared: &[(usize, usize)] = if c < COPIES { &RANGES } else { &[(0, WLEN)] };
+            for &(from, to) in declared {
+                let r = ranges.len();
+                ranges.push((c, start + from, start + to));
+                let span = card_span_of(start, from, to);
+                for p in 0..span.pieces {
+                    let (lo, hi) = card_piece_of(start, len, &span, p);
+                    pieces.push((r, c, start, lo, hi, fetched_len));
+                    fetched_len += hi - lo;
+                }
+            }
+        }
+        // The CPU sides and title memory get patterns of their own; the
+        // fetched bytes are a side's with most bytes changed (a
+        // submission's shader writes). One piece in 16 did not change
+        // and is left so: those merges always find nothing.
+        let cpus: Vec<Vec<u8>> = (0..COPIES + WINDOWS).map(|c| (0..lens[c]).map(|i| pat(c, i)).collect()).collect();
+        let title: Vec<u8> = (0..COPIES * PITCH).map(|i| (i as u32).wrapping_mul(17).wrapping_add(0x6d) as u8).collect();
+        let mut fetched = vec![0u8; fetched_len];
+        for (which, &(_, c, _, lo, hi, at)) in pieces.iter().enumerate() {
+            for k in 0..hi - lo {
+                let mut b = pat(c, lo + k);
+                if (lo + k) / 512 % 8 != 0 && which % 16 != 7 {
+                    b ^= 0xa5;
+                }
+                fetched[at + k] = b;
+            }
+        }
+        // Before a frame's merges, the frame's own shader writes at
+        // these scattered offsets — a piece's first and last bytes
+        // among them, so its merge runs the piece's whole length. Set,
+        // not flipped, so the two runs below see the same bytes
+        // whatever order they ran in. (Without fresh writes the second
+        // frame would leave the side holding the card's bytes and later
+        // frames would find nothing.)
+        let refetch = |fetched: &mut Vec<u8>, f: usize| {
+            for (which, &(_, c, _, lo, hi, at)) in pieces.iter().enumerate() {
+                if which % 16 == 7 {
+                    continue;
+                }
+                let n = hi - lo;
+                for k in (0..n).step_by(977) {
+                    fetched[at + k] = pat(c, lo + k) ^ (0xa5u8).wrapping_add(f as u8);
+                }
+                fetched[at + n - 1] = pat(c, hi - 1) ^ (0xa5u8).wrapping_add(f as u8);
+            }
+        };
+        // Spawn the kept threads before the clock runs.
+        wide((0..2).map(|_| Box::new(|| {}) as Job).collect());
+
+        // Piece by piece, as `card_back` does without the switch, for
+        // `FRAMES` submissions in a row.
+        let mut written_seq = vec![0usize; ranges.len()];
+        let (mut title_seq, mut cpus_seq) = (title.clone(), cpus.clone());
+        let mut one_by_one = std::time::Duration::ZERO;
+        for f in 0..FRAMES {
+            refetch(&mut fetched, f);
+            let frame = std::time::Instant::now();
+            let mut scratch = Vec::new();
+            for &(r, c, start, lo, hi, at) in &pieces {
+                let gpu = &fetched[at..at + hi - lo];
+                written_seq[r] += card_merge(gpu, &mut cpus_seq[c][lo..hi], &mut title_seq[start + lo..start + hi], &mut scratch);
+            }
+            one_by_one += frame.elapsed();
+        }
+
+        // On the kept threads, as `card_back` does with the switch: the
+        // spans grouped where a copy's items or touching title ranges
+        // meet, one job a group, its items in the list's order.
+        let (mut title_wide, mut cpus_wide) = (title, cpus);
+        let spans: Vec<(usize, usize, usize)> = pieces.iter().map(|&(r, ..)| ranges[r]).collect();
+        let counts = Arc::new((0..ranges.len()).map(|_| AtomicUsize::new(0)).collect::<Vec<_>>());
+        let fetched_base = fetched.as_ptr() as usize;
+        let title_base = title_wide.as_mut_ptr() as usize;
+        let cpu_bases: Vec<usize> = cpus_wide.iter_mut().map(|c| c.as_mut_ptr() as usize).collect();
+        let mut n_groups = 0;
+        let mut on_the_threads = std::time::Duration::ZERO;
+        for f in 0..FRAMES {
+            refetch(&mut fetched, f);
+            let frame = std::time::Instant::now();
+            let groups = merge_groups(&spans);
+            n_groups = groups.len();
+            let jobs: Vec<Job> = groups
+                .into_iter()
+                .map(|group| {
+                    let chunk: Vec<(usize, usize, usize, usize, usize, usize)> = group.into_iter().map(|p| pieces[p]).collect();
+                    let (counts, cpu_bases) = (counts.clone(), cpu_bases.clone());
+                    Box::new(move || {
+                        let mut scratch = Vec::new();
+                        for (r, c, start, lo, hi, at) in chunk {
+                            // SAFETY: `[at, at + hi - lo)` lies in
+                            // `fetched`; `[lo, hi)` in copy `c`'s side,
+                            // which no other job writes (same copy,
+                            // same group); the title range is inside
+                            // the range's declared span, which no other
+                            // group touches (`merge_groups`), and the
+                            // caller waits for the jobs.
+                            unsafe {
+                                let gpu = std::slice::from_raw_parts((fetched_base + at) as *const u8, hi - lo);
+                                let old = std::slice::from_raw_parts_mut((cpu_bases[c] + lo) as *mut u8, hi - lo);
+                                let title = std::slice::from_raw_parts_mut((title_base + start + lo) as *mut u8, hi - lo);
+                                counts[r].fetch_add(card_merge(gpu, old, title, &mut scratch), Ordering::Relaxed);
+                            }
+                        }
+                    }) as Job
+                })
+                .collect();
+            wide(jobs);
+            on_the_threads += frame.elapsed();
+        }
+
+        let written_wide: Vec<usize> = counts.iter().map(|c| c.load(Ordering::Relaxed)).collect();
+        assert_eq!(written_wide, written_seq, "bytes written per declared range");
+        assert!(title_wide == title_seq, "title memory differs after the wide merge");
+        assert!(cpus_wide == cpus_seq, "a copy's side differs after the wide merge");
+        // Every window's range meets its host copy's, so each lands in
+        // the copy's group: one job per copy.
+        assert_eq!(n_groups, COPIES);
+        println!(
+            "{FRAMES} frames of {} copies ({WINDOWS} of them windows in another's range), {} pieces, {} MiB fetched a frame, \
+             {n_groups} groups: piece by piece {one_by_one:?}, on the threads {on_the_threads:?} ({:.1}x), \
+             {} MiB put into title memory",
+            COPIES + WINDOWS,
+            pieces.len(),
+            fetched.len() >> 20,
+            one_by_one.as_secs_f64() / on_the_threads.as_secs_f64(),
+            written_seq.iter().sum::<usize>() >> 20,
+        );
     }
 }
 

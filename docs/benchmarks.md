@@ -10,6 +10,7 @@ Run with `cargo test -p <crate> --release -- --ignored <name> --nocapture`:
 | Benchmark | Measures |
 |---|---|
 | `host::batch::texture_checks_per_submission` (mesia-gpu) | per-submission texture check cost |
+| `shadow::wide_tests::heavy_frames_of_merges_run_wide_and_merge_the_same` (mesia-gpu) | O1 copy-back merge: sequential vs `MESIA_WIDE_MERGE` threads — asserts byte-identical output (484 MiB/frame × 6 frames) |
 | `emit::bitcode::tests::bench_write` (mesia-shader) | DXIL bitcode emission throughput |
 
 Each prints wall-times; they are synthetic — no title data involved.
