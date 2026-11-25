@@ -320,6 +320,18 @@ pub(crate) fn card_dirty(sent_as: u64) -> Vec<(Arc<Shadow>, Vec<(usize, usize)>)
     out
 }
 
+/// Ranges `card_dirty` drained go back when nothing can send them (no
+/// host list): else they would never reach the card. The sends they were
+/// numbered with never happened.
+pub(crate) fn re_dirty(shadow: &Shadow, ranges: &[(usize, usize)], sent_as: u64) {
+    if let Some(card) = &shadow.card {
+        card.dirty.lock().unwrap_or_else(|e| e.into_inner()).extend_from_slice(ranges);
+        if relay() {
+            card.sent.lock().unwrap_or_else(|e| e.into_inner()).retain(|s| s.2 != sent_as);
+        }
+    }
+}
+
 /// Ranges in order, those that overlap or touch as one.
 fn joined(mut ranges: Vec<(usize, usize)>) -> Vec<(usize, usize)> {
     ranges.sort_unstable();
@@ -813,7 +825,7 @@ static POOL: Mutex<Vec<Vec<u8>>> = Mutex::new(Vec::new());
 /// of about that size: a small copy's snapshot took the 174 MB buffer kept
 /// for the big heap's, which then got another, until eight of them were
 /// reserved (1.4 GB in run 24).
-fn pooled(n: usize) -> Vec<u8> {
+fn pooled(n: usize) -> Option<Vec<u8>> {
     let mut pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
     let most = n.saturating_mul(4).max(1 << 20);
     let fit = pool
@@ -824,11 +836,24 @@ fn pooled(n: usize) -> Vec<u8> {
         .map(|(i, _)| i);
     let mut v = match fit {
         Some(i) => pool.swap_remove(i),
-        None => Vec::with_capacity(n),
+        None => {
+            // Under memory pressure a hundreds-of-MB snapshot aborts the
+            // process at the allocator; dropping this range's writes
+            // instead keeps the run (they come back on a later snapshot).
+            let mut v = Vec::new();
+            if v.try_reserve_exact(n).is_err() {
+                NO_SNAPSHOT.fetch_add(1, Ordering::Relaxed);
+                return None;
+            }
+            v
+        }
     };
     v.clear();
-    v
+    Some(v)
 }
+
+/// Snapshots the memory pressure would not give (their writes dropped).
+static NO_SNAPSHOT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Returns a snapshot buffer to the pool: at most 8 kept, the largest, and
 /// of those the largest one and the next ones up to `KEPT` bytes in all.
@@ -2167,7 +2192,12 @@ impl Shadow {
         BACK_CLASS[usize::from(!self.window)].fetch_add(taken as u64, Ordering::Relaxed);
         let total = self.len as usize;
         let mut before = self.before.lock().unwrap_or_else(|e| e.into_inner());
-        let snapshot = before.get_or_insert_with(|| pooled(total));
+        if before.is_none() {
+            *before = pooled(total);
+        }
+        let Some(snapshot) = before.as_mut() else {
+            return;
+        };
         if keeps() {
             // Piece by piece, and only the pieces not known current. A
             // piece the part holds whole is current from now on; of a

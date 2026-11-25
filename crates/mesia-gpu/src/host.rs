@@ -3058,7 +3058,13 @@ impl Host {
         let mut used: Vec<(bool, Prelude)> = Vec::new();
         if !dirty.is_empty() {
             let Some(sync) = work.sync.pop().or_else(|| self.make_prelude()) else {
-                fail(format_args!("no host list to bring host copies in the card's memory up to date"));
+                // No list to send them on: the ranges go back dirty for
+                // the next submission rather than never reach the card.
+                for (shadow, ranges) in &dirty {
+                    crate::shadow::re_dirty(shadow, ranges, sent_as);
+                }
+                tracing::warn!("no host list to bring host copies in the card's memory up to date; they stay dirty");
+                return None;
             };
             let (allocator, list) = &sync;
             // SAFETY: the list's last run finished (it ran ahead of a
@@ -3173,7 +3179,14 @@ impl Host {
         work.taken = at;
         if plan.ranges.iter().any(|r| r.compared) {
             let Some(check) = work.check.pop().or_else(|| self.make_prelude()) else {
-                fail(format_args!("no host list for the compare of host copies in the card's memory"));
+                // No list to compare on: every declared piece is fetched
+                // whole (conservative, slower, still right).
+                for r in &mut plan.ranges {
+                    r.compared = false;
+                }
+                tracing::warn!("no host list for the compare of host copies in the card's memory; every declared piece is fetched");
+                work.out += 1;
+                return Some(plan);
             };
             let (allocator, list) = &check;
             // SAFETY: the list's last run finished (its submission was
@@ -3333,104 +3346,126 @@ impl Host {
         };
         if f.buffer.as_ref().is_none_or(|b| b.2 < total) {
             let size = total.next_multiple_of(16 << 20);
-            f.buffer = self.shared_buffer(size).map(|(buffer, data)| (buffer, data as usize, size));
+            // Under memory pressure the grow may fail: the buffer it had
+            // is still good — the pieces go through it in turns below.
+            if let Some((buffer, data)) = self.shared_buffer(size) {
+                f.buffer = Some((buffer, data as usize, size));
+            }
         }
-        let Some((buffer, data, _)) = f.buffer.clone() else {
+        let Some((buffer, data, cap)) = f.buffer.clone() else {
             fail(format_args!("no memory to fetch what shaders wrote to the card's memory ({total} bytes, MESIA_RELAY=1)"));
         };
-        f.sent += 1;
-        let ((allocator, list), fence, event, sent) = (f.list.clone(), f.fence.clone(), f.event, f.sent);
-        let waiting = std::time::Instant::now();
-        // SAFETY: the list's last run was waited for by this thread; live
-        // buffers (the copies are held by the plans); the fence and the
-        // event are this thread's.
-        let ran = unsafe {
-            (|| -> windows::core::Result<u64> {
-                allocator.Reset()?;
-                list.Reset(&allocator, None)?;
-                for (shadow, lo, hi, at) in &pieces {
-                    list.CopyBufferRegion(&buffer, *at, &shadow.buffer, *lo as u64, (*hi - *lo) as u64);
-                }
-                list.Close()?;
-                let lists = [Some(list.cast::<ID3D12CommandList>()?)];
-                // In the order of the queue: the sends of title bytes so
-                // far are ahead of this fetch, every later one behind it.
-                let order = QUEUE_ORDER.lock().unwrap_or_else(|e| e.into_inner());
-                self.queue.ExecuteCommandLists(&lists);
-                let after = *order;
-                drop(order);
-                self.card_sent();
-                self.queue.Signal(&fence, sent)?;
-                fence.SetEventOnCompletion(sent, event)?;
-                WaitForSingleObject(event, INFINITE);
-                Ok(after)
-            })()
-        };
-        let after = match ran {
-            Ok(after) => after,
-            Err(e) => fail(format_args!("what shaders wrote to the card's memory could not be fetched ({e}, MESIA_RELAY=1)")),
-        };
-        let us = waiting.elapsed().as_micros() as u64;
-        RELAY_STATS[3].fetch_add(us, Ordering::Relaxed);
-        {
-            use crate::shadow::CARD_STATS;
-            CARD_STATS[3].fetch_add(pieces.len() as u64, Ordering::Relaxed);
-            CARD_STATS[4].fetch_add(total, Ordering::Relaxed);
-            CARD_STATS[5].fetch_add(1, Ordering::Relaxed);
-            CARD_STATS[6].fetch_add(us, Ordering::Relaxed);
-        }
-        let written = if wide_merge() && pieces.len() >= 8 {
-            // Several pieces at a time, but pieces of a copy, or whose
-            // title ranges touch, keep their order in one job (two
-            // copies can cover the same title bytes).
-            let fetched = data;
-            let written = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-            let spans: Vec<(usize, usize, usize)> = pieces
-                .iter()
-                .map(|(shadow, lo, hi, _)| {
-                    let (a, b) = shadow.title_range(*lo, *hi);
-                    (std::sync::Arc::as_ptr(shadow) as usize, a, b)
-                })
-                .collect();
-            let jobs: Vec<Box<dyn FnOnce() + Send>> = crate::shadow::merge_groups(&spans)
-                .into_iter()
-                .map(|group| {
-                    let chunk: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize, u64)> = group
-                        .into_iter()
-                        .map(|p| {
-                            let (s, lo, hi, at) = &pieces[p];
-                            (s.clone(), *lo, *hi, *at)
-                        })
-                        .collect();
-                    let written = written.clone();
-                    Box::new(move || {
-                        let mut title = Vec::new();
-                        let mut n = 0;
-                        for (shadow, lo, hi, at) in chunk {
-                            // SAFETY: the mapping of the fetched bytes;
-                            // the copy into it has run, and the caller
-                            // waits for this job.
-                            let gpu = unsafe { std::slice::from_raw_parts((fetched + at as usize) as *const u8, hi - lo) };
-                            n += shadow.card_merge_relay(lo, gpu, after, &mut title);
-                        }
-                        written.fetch_add(n, Ordering::Relaxed);
-                    }) as Box<dyn FnOnce() + Send>
-                })
-                .collect();
-            crate::shadow::wide_run(jobs);
-            written.load(Ordering::Relaxed)
-        } else {
-            let mut title = Vec::new();
-            let mut written = 0;
-            for (shadow, lo, hi, at) in &pieces {
-                // SAFETY: the mapping of the fetched bytes, `total` of them;
-                // the copy into it has run.
-                let gpu = unsafe { std::slice::from_raw_parts((data + *at as usize) as *const u8, hi - lo) };
-                written += shadow.card_merge_relay(*lo, gpu, after, &mut title);
+        let mut after = 0;
+        let mut off = 0usize;
+        while off < pieces.len() {
+            // One fetch's worth: whole pieces while they fit the buffer.
+            let mut room = 0usize;
+            let mut end = off;
+            while end < pieces.len() && room + (pieces[end].2 - pieces[end].1) <= cap as usize {
+                room += pieces[end].2 - pieces[end].1;
+                end += 1;
             }
-            written
-        };
-        COPY_BACK[1].fetch_add(written as u64, Ordering::Relaxed);
+            if end == off {
+                end += 1;
+            }
+            let chunk = &pieces[off..end];
+            let base = chunk[0].3;
+            f.sent += 1;
+            let ((allocator, list), fence, event, sent) = (f.list.clone(), f.fence.clone(), f.event, f.sent);
+            let waiting = std::time::Instant::now();
+            // SAFETY: the list's last run was waited for by this thread;
+            // live buffers (the copies are held by the plans); the fence
+            // and the event are this thread's.
+            let ran = unsafe {
+                (|| -> windows::core::Result<u64> {
+                    allocator.Reset()?;
+                    list.Reset(&allocator, None)?;
+                    for (shadow, lo, hi, at) in chunk {
+                        list.CopyBufferRegion(&buffer, at - base, &shadow.buffer, *lo as u64, (*hi - *lo) as u64);
+                    }
+                    list.Close()?;
+                    let lists = [Some(list.cast::<ID3D12CommandList>()?)];
+                    // In the order of the queue: the sends of title bytes
+                    // so far are ahead of this fetch, every later one
+                    // behind it.
+                    let order = QUEUE_ORDER.lock().unwrap_or_else(|e| e.into_inner());
+                    self.queue.ExecuteCommandLists(&lists);
+                    let after = *order;
+                    drop(order);
+                    self.card_sent();
+                    self.queue.Signal(&fence, sent)?;
+                    fence.SetEventOnCompletion(sent, event)?;
+                    WaitForSingleObject(event, INFINITE);
+                    Ok(after)
+                })()
+            };
+            after = match ran {
+                Ok(after) => after,
+                Err(e) => fail(format_args!("what shaders wrote to the card's memory could not be fetched ({e}, MESIA_RELAY=1)")),
+            };
+            let us = waiting.elapsed().as_micros() as u64;
+            RELAY_STATS[3].fetch_add(us, Ordering::Relaxed);
+            {
+                use crate::shadow::CARD_STATS;
+                CARD_STATS[3].fetch_add(chunk.len() as u64, Ordering::Relaxed);
+                CARD_STATS[4].fetch_add(room as u64, Ordering::Relaxed);
+                CARD_STATS[5].fetch_add(1, Ordering::Relaxed);
+                CARD_STATS[6].fetch_add(us, Ordering::Relaxed);
+            }
+            let written = if wide_merge() && chunk.len() >= 8 {
+                // Several pieces at a time, but pieces of a copy, or
+                // whose title ranges touch, keep their order in one job
+                // (two copies can cover the same title bytes).
+                let fetched = data;
+                let written = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+                let spans: Vec<(usize, usize, usize)> = chunk
+                    .iter()
+                    .map(|(shadow, lo, hi, _)| {
+                        let (a, b) = shadow.title_range(*lo, *hi);
+                        (std::sync::Arc::as_ptr(shadow) as usize, a, b)
+                    })
+                    .collect();
+                let jobs: Vec<Box<dyn FnOnce() + Send>> = crate::shadow::merge_groups(&spans)
+                    .into_iter()
+                    .map(|group| {
+                        let work: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize, u64)> = group
+                            .into_iter()
+                            .map(|p| {
+                                let (s, lo, hi, at) = &chunk[p];
+                                (s.clone(), *lo, *hi, *at)
+                            })
+                            .collect();
+                        let written = written.clone();
+                        Box::new(move || {
+                            let mut title = Vec::new();
+                            let mut n = 0;
+                            for (shadow, lo, hi, at) in work {
+                                // SAFETY: the mapping of the fetched
+                                // bytes; the copy into it has run, and
+                                // the caller waits for this job.
+                                let gpu = unsafe { std::slice::from_raw_parts((fetched + (at - base) as usize) as *const u8, hi - lo) };
+                                n += shadow.card_merge_relay(lo, gpu, after, &mut title);
+                            }
+                            written.fetch_add(n, Ordering::Relaxed);
+                        }) as Box<dyn FnOnce() + Send>
+                    })
+                    .collect();
+                crate::shadow::wide_run(jobs);
+                written.load(Ordering::Relaxed)
+            } else {
+                let mut title = Vec::new();
+                let mut written = 0;
+                for (shadow, lo, hi, at) in chunk {
+                    // SAFETY: the mapping of the fetched bytes; the copy
+                    // into it has run.
+                    let gpu = unsafe { std::slice::from_raw_parts((data + (*at - base) as usize) as *const u8, hi - lo) };
+                    written += shadow.card_merge_relay(*lo, gpu, after, &mut title);
+                }
+                written
+            };
+            COPY_BACK[1].fetch_add(written as u64, Ordering::Relaxed);
+            off = end;
+        }
         // Sends up to `after` are of no use to any later merge.
         crate::shadow::relay_fetched(after);
     }
@@ -3598,11 +3633,18 @@ impl Host {
         if !pieces.is_empty() {
             if work.fetched.as_ref().is_none_or(|f| f.2 < total) {
                 let size = total.next_multiple_of(16 << 20);
-                work.fetched = self.shared_buffer(size).map(|(buffer, data)| (buffer, data as usize, size));
+                // The old buffer is kept when the grow fails: still good
+                // for later, smaller fetches.
+                if let Some((buffer, data)) = self.shared_buffer(size) {
+                    work.fetched = Some((buffer, data as usize, size));
+                }
             }
-            let Some((fetched, data, _)) = &work.fetched else {
+            let Some((fetched, data, cap)) = &work.fetched else {
                 fail(format_args!("no memory to fetch what shaders wrote to the card's memory ({total} bytes)"));
             };
+            if *cap < total {
+                fail(format_args!("not enough memory to fetch what shaders wrote to the card's memory ({total} bytes in {cap})"));
+            }
             let waiting = std::time::Instant::now();
             let (allocator, list) = &work.fetch;
             // SAFETY: the list's last run was waited for; live buffers; the
