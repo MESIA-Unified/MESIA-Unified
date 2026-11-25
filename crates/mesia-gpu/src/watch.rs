@@ -646,6 +646,20 @@ pub fn title_memory_remapped(at: usize, len: usize) {
     crate::inplace::views_gone(at, len);
     // And nothing stays in place over it.
     crate::inplace::title_memory_freeing(at, len);
+    // Writes the journal holds for pages wholly inside are of memory that
+    // is gone (a later mapping at the address would report them): they go,
+    // which also keeps the journal from growing with every mapping. A page
+    // the range cuts keeps its entry — the rest of it may still be written.
+    {
+        let pages = at.div_ceil(PAGE)..at.saturating_add(len) / PAGE;
+        if !pages.is_empty() {
+            let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
+            let gone: Vec<usize> = j.written.range(pages).map(|(&page, _)| page).collect();
+            for page in gone {
+                j.written.remove(&page);
+            }
+        }
+    }
     let mut g = guards();
     let range = at / BLOCK..at.saturating_add(len).div_ceil(BLOCK);
     let absent: Vec<usize> = g.absent.range(range.clone()).copied().collect();
@@ -732,6 +746,9 @@ mod tests {
             )
         } as usize;
         assert_ne!(p, 0);
+        // As the runtime tells of every mapping (an earlier test's freed
+        // memory at this address left its writes in the journal).
+        title_memory_remapped(p, 4 * PAGE);
         let (start, end) = (p, p + 4 * PAGE);
         let (_, before) = writes(start, end, false).expect("watched");
         assert!(before.is_empty());
