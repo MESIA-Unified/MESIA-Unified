@@ -391,5 +391,68 @@ mod x64 {
                 assert_ne!(VirtualFree(src, 0, MEM_RELEASE), 0);
             }
         }
+
+        /// Independent benchmark (V5.6 A1): the instruction vs the kernel on
+        /// buffers this process owns, across the sizes the copy path moves.
+        /// Run: `cargo test --release -p mesia-gpu plain_vs_kernel -- --ignored --nocapture`.
+        #[test]
+        #[ignore = "benchmark"]
+        fn plain_vs_kernel_copy_rates() {
+            use std::time::Instant;
+            assert!(install());
+            let faults = Faults::new();
+            let rpm = |src: *const u8, dst: *mut u8, len: usize| {
+                let mut bytes = 0;
+                // SAFETY: both buffers are this process's own, `len` long.
+                unsafe {
+                    ReadProcessMemory(
+                        GetCurrentProcess(),
+                        src.cast(),
+                        dst.cast(),
+                        len,
+                        &mut bytes,
+                    )
+                }
+            };
+            println!("{:>10} {:>12} {:>12} {:>12} {:>10}", "len", "plain ns", "kernel ns", "GB/s x", "checked");
+            for &len in &[256usize, 4096, 16384, 65536, 262144, 1048576, 4194304] {
+                let iters = (256 << 20) / len;
+                let mut src = vec![0u8; len + 64];
+                for (i, b) in src.iter_mut().enumerate() {
+                    *b = (i as u32).wrapping_mul(2654435761) as u8;
+                }
+                let mut dst = vec![0u8; len + 64];
+                // The worst case for the instruction: an unaligned source.
+                let (src_at, dst_at) = unsafe { (src.as_ptr().add(37), dst.as_mut_ptr().add(11)) };
+                let t = Instant::now();
+                let mut plain = 0usize;
+                for _ in 0..iters {
+                    // SAFETY: separate buffers, each `len` bytes from the offsets.
+                    if unsafe { attempt(src_at, dst_at, len, &faults) } == Path::Plain {
+                        plain += 1;
+                    }
+                }
+                let plain_ns = t.elapsed().as_nanos() as f64 / iters as f64;
+                let t = Instant::now();
+                for _ in 0..iters {
+                    assert_ne!(rpm(src_at, dst_at, len), 0);
+                }
+                let kernel_ns = t.elapsed().as_nanos() as f64 / iters as f64;
+                assert_eq!(plain, iters, "every read of committed memory must take the fast path");
+                // SAFETY: same extent both paths wrote last.
+                let (a, b) = unsafe {
+                    (
+                        std::slice::from_raw_parts(src_at, len),
+                        std::slice::from_raw_parts(dst_at, len),
+                    )
+                };
+                assert_eq!(a, b, "the kernel's last copy must equal the source");
+                println!(
+                    "{len:>10} {plain_ns:>12.0} {kernel_ns:>12.0} {:>12.2} {:>10}",
+                    kernel_ns / plain_ns,
+                    iters
+                );
+            }
+        }
     }
 }

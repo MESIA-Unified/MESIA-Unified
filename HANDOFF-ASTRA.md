@@ -3,6 +3,33 @@
 Baseline : `3a46661` (2026-11-26). Charge : `game_scarlett_master.exe`,
 `INPLACE=1`, `WINDOW_KB=1024`, `WIDE_REFRESH/MERGE/BACK=1`, `ASK_ONCE` défaut.
 
+## V5.6 — donnée nouvelle : le crash est aussi atteignable sous `LATE_WAIT=2`
+
+Table 2×2 des runs V5.5-V5.6 (même save, même scène, `LATE_WAIT=2`) :
+
+| Gating `Step::Host` | `MESIA_COPY_PLAIN` | Résultat |
+|---|---|---|
+| ✓ | ✓ | DEVICE_HUNG ~5 min in-world (« 5 of 11 ») |
+| ✓ | — | DEVICE_HUNG ~35 s in-world (« 4 of 10 ») |
+| — | — | stable >50 min (et >11 h sur binaire antérieur) |
+| — | ✓ | DEVICE_HUNG ~3 min in-world (« 5 of 11 ») |
+
+**Les deux features indépendantes déclenchent le même crash** → le résiduel
+n'est pas un bug de l'une d'elles : c'est un bug latent **sensible au timing
+de lecture/soumission**. Ce que les deux changent : quand et comment la
+mémoire titre est lue au submit (gating = attend les écrits en vol ;
+plaincopy = lit in-process ~3-10× plus vite que `ReadProcessMemory` —
+benchmark indépendant : 6,5× à 256 o, 10× à 4 Kio, 1,5-3,5× au-delà).
+Signature commune : faible profondeur (« 4-5 ahead of 10-11 lists » —
+régime d'entrée du monde, pas les ~130 listes du steady), `DEVICE_HUNG`
+0x887A0006, breadcrumbs indisponibles (0x887A0004 = l'API DRED elle-même,
+pas la cause). Hypothèse : la marge de timing sous `LATE_WAIT=2` est mince —
+toute accélération de la préparation envoie les vols plus tôt/plus profonds
+et expose la même race que `LATE_WAIT=3` expose toujours. Conséquence
+programme : le résiduel bloque probablement toute optimisation du chemin
+de soumission — le résoudre débloque le levier wait-GPU-hors-lock et les
+copies rapides en même temps.
+
 ## Fait établi
 
 - `LATE_WAIT=0` synchrone : stable indéfiniment (~470-520 ms/frame).

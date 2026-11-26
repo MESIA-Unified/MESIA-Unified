@@ -1,5 +1,16 @@
 # Session autonome — notes de travail (2026-11-25)
 
+## 27 novembre 2026 — V5.6, Kelvaroq phase 1.5 : upload_pool intégré ; résiduel = timing-sensible (donnée majeure)
+
+**Base `951e4e3`.** Phase 1.5 Kelvaroq — validation indépendante + port du seul drop-in non redondant.
+
+- **Découverte structurelle** : la table 2×2 des runs établit que **deux features indépendantes** (gating `Step::Host` et `MESIA_COPY_PLAIN`) déclenchent chacune le même `DEVICE_HUNG` sous `LATE_WAIT=2` (signatures « 4 of 10 » / « 5 of 11 », régime d'entrée du monde). Le crash n'est donc **pas** un bug de plaincopy ou du gating : c'est le résiduel latent, **sensible au timing de préparation** — toute accélération de lecture/soumission l'expose. Consigné en tête de HANDOFF-ASTRA.md : c'est probablement le même bug que stage 3, et il bloque toute optimisation du chemin de soumission.
+- **A1 benchmark plaincopy** (buffers du processus de test, 256 Mio/taille, bytes vérifiés, source désalignée) : **6,5×** à 256 o, **10,2×** à 4 Kio, 8,2× à 16 Kio, 1,5-3,5× au-delà. Efficacité prouvée ; en jeu il déclenche le résiduel → reste OFF.
+- **A2-A4 drop-ins** : `dirty_ranges`/`texel_rows`/`residency` = **redondants** (équivalents exacts déjà dans `joined()`, `Layout::walk`, `mapped_bytes`). `upload_pool` = seul port valable → implémente le TODO de `HostList::upload`.
+- **`upload_pool` intégré** : `upload_class` quart-d'octave + `Pool<T>` 256 Mio près de `Spare` (attribution GPL), `MESIA_UPLOAD_POOL=0` pour revenir. Recyclage à `reset()` (post-soumissions, même point sûr que les chunks) ; ALIVE 8→11 + ligne mémoire. 135 tests verts.
+- **Soak témoin `951e4e3`** : >50 min in-world, **P50=447 ms / P95=536 ms** (records), RSS 2,4-4,7 Go sans fuite.
+- **Docs** : KELVAROQ-PHASE1-FINAL.md, MEMORY-OPTIMIZATION-RESULTS.md, ANIMATION-TRANSITION-VALIDATION.md (fixture spécifiée, non implémentée).
+
 ## 27 novembre 2026 — V5.5, Kelvaroq phase 1 : plaincopy porté (dormant), gating Step::Host reverté après 2 crashs
 
 **Base `aa9be38`.** Intégration phase 1 du roadmap Kelvaroq. Provenance vérifiée : `plaincopy` (patch 0044) et les drop-ins render sont GPL-3.0-or-later pur, aucun flag XCL — importables avec attribution.

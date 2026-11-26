@@ -485,8 +485,10 @@ pub(crate) static MADE: [std::sync::atomic::AtomicU64; 6] = [const { std::sync::
 /// next list, [`Spare`]) and their bytes; chunks taken from those kept
 /// instead of made, since the start; and the lists' other upload buffers
 /// (texture data copied from buffers, scratch too big for a chunk) and
-/// their bytes.
-pub(crate) static ALIVE: [std::sync::atomic::AtomicU64; 8] = [const { std::sync::atomic::AtomicU64::new(0) }; 8];
+/// their bytes; of those, the buffers no list holds (kept for the next
+/// list, [`Pool`]) and their bytes; buffers taken from those kept instead
+/// of made, since the start.
+pub(crate) static ALIVE: [std::sync::atomic::AtomicU64; 11] = [const { std::sync::atomic::AtomicU64::new(0) }; 11];
 
 /// About host lists, for the memory line: lists made by the host since the
 /// start; preludes made (a list's second allocator and list, made when it
@@ -1497,6 +1499,231 @@ impl<T> Spare<T> {
 /// Scratch chunks no list holds.
 static SPARE: Mutex<Spare<Chunk>> = Mutex::new(Spare::new());
 
+/// The smallest upload class: small buffers share one size.
+const UPLOAD_CLASS_MIN: u64 = 64 << 10;
+
+/// The size class of a buffer of `bytes`: quarter octaves from 64 KiB, so a
+/// class is at most a quarter larger than what was asked for.
+/// Derived from Kelvaroq's `kelvaroq-render/upload_pool.rs` (GPL-3.0-or-later,
+/// (c) 2026 Stellarr Studio SAS, https://github.com/stellarr-studio/kelvaroq
+/// @ 1270c422).
+fn upload_class(bytes: u64) -> u64 {
+    let b = bytes.max(UPLOAD_CLASS_MIN);
+    let top = 63 - b.leading_zeros();
+    let step = 1u64 << top.saturating_sub(2);
+    b.div_ceil(step).saturating_mul(step)
+}
+
+/// Buffers kept for reuse by size class, `limit` bytes at most. A kept
+/// buffer's capacity is its class size, so `take` can match by the class of
+/// what is asked for.
+/// Derived from Kelvaroq's `kelvaroq-render/upload_pool.rs` (GPL-3.0-or-later,
+/// (c) 2026 Stellarr Studio SAS, https://github.com/stellarr-studio/kelvaroq
+/// @ 1270c422).
+struct Pool<T> {
+    free: std::collections::BTreeMap<u64, Vec<T>>,
+    bytes: u64,
+    limit: u64,
+}
+
+impl<T> Pool<T> {
+    const fn new(limit: u64) -> Self {
+        Self {
+            free: std::collections::BTreeMap::new(),
+            bytes: 0,
+            limit,
+        }
+    }
+
+    /// A kept buffer of the class of `bytes`, if there is one.
+    fn take(&mut self, bytes: u64) -> Option<T> {
+        let class = upload_class(bytes);
+        let list = self.free.get_mut(&class)?;
+        let item = list.pop()?;
+        if list.is_empty() {
+            self.free.remove(&class);
+        }
+        self.bytes -= class;
+        Some(item)
+    }
+
+    /// Keeps a buffer of `capacity` bytes (a class size) for reuse; gives it
+    /// back when that would pass the limit or the size is not a class.
+    fn give(&mut self, capacity: u64, item: T) -> Option<T> {
+        if capacity != upload_class(capacity)
+            || self.bytes.saturating_add(capacity) > self.limit
+        {
+            return Some(item);
+        }
+        self.bytes += capacity;
+        self.free.entry(capacity).or_default().push(item);
+        None
+    }
+
+    /// Bytes kept.
+    #[cfg(test)]
+    fn bytes(&self) -> u64 {
+        self.bytes
+    }
+
+    /// Changes the limit, letting go of the largest buffers past it.
+    #[cfg(test)]
+    fn set_limit(&mut self, limit: u64) -> Vec<T> {
+        self.limit = limit;
+        let mut out = Vec::new();
+        while self.bytes > self.limit {
+            let Some(mut entry) = self.free.last_entry() else {
+                break;
+            };
+            let class = *entry.key();
+            if let Some(item) = entry.get_mut().pop() {
+                self.bytes -= class;
+                out.push(item);
+            }
+            if entry.get().is_empty() {
+                entry.remove();
+            }
+        }
+        out
+    }
+}
+
+/// Whether lists share their upload buffers of one-off sizes (buffer→texture
+/// footprints, scratch too big for a chunk): taken at the class of the size
+/// asked, given back when the list is reset — after its submissions ran, the
+/// same point chunks are shared at. Before, every such buffer was made,
+/// zeroed and freed per copy: 42,607 upload buffers of 77.9 GB in five
+/// minutes of run 60. `MESIA_UPLOAD_POOL=0`: made and freed per list, as
+/// before.
+fn upload_pool() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("MESIA_UPLOAD_POOL").is_none_or(|v| v != "0"))
+}
+
+#[cfg(test)]
+mod pool_tests {
+    use super::*;
+
+    // Ported from Kelvaroq's `kelvaroq-render/upload_pool.rs` tests
+    // (GPL-3.0-or-later, (c) 2026 Stellarr Studio SAS).
+
+    #[test]
+    fn classes_cover_the_request_with_at_most_a_quarter_more() {
+        for bytes in [
+            1,
+            4096,
+            UPLOAD_CLASS_MIN,
+            UPLOAD_CLASS_MIN + 1,
+            100_000,
+            1 << 20,
+            (1 << 20) + 1,
+            3 << 20,
+            22_369_621,
+            1 << 30,
+        ] {
+            let c = upload_class(bytes);
+            assert!(c >= bytes.max(UPLOAD_CLASS_MIN), "{bytes}");
+            assert!(
+                c <= bytes.max(UPLOAD_CLASS_MIN) + bytes.max(UPLOAD_CLASS_MIN) / 4,
+                "{bytes} -> {c}"
+            );
+            assert_eq!(upload_class(c), c, "a class is its own class");
+        }
+        assert_eq!(upload_class(1), UPLOAD_CLASS_MIN);
+        assert_eq!(upload_class((1 << 20) + 1), (1 << 20) + (1 << 18));
+    }
+
+    #[test]
+    fn reuse_is_by_class_and_bounded() {
+        let mut pool = Pool::new(3 << 20);
+        let a = upload_class(1 << 20);
+        assert!(pool.take(1 << 20).is_none());
+        assert!(pool.give(a, "a").is_none());
+        assert!(pool.give(a, "b").is_none());
+        // Past the limit: handed back.
+        assert_eq!(pool.give(upload_class(2 << 20), "c"), Some("c"));
+        // Not a class size: handed back.
+        assert_eq!(pool.give(a + 1, "d"), Some("d"));
+        assert_eq!(pool.bytes(), 2 << 20);
+        // Another request of the same class takes one.
+        assert!(pool.take(1_000_000).is_some());
+        assert!(pool.take(1 << 19).is_none());
+        assert!(pool.take(1 << 20).is_some());
+        assert!(pool.take(1 << 20).is_none());
+        assert_eq!(pool.bytes(), 0);
+    }
+
+    #[test]
+    fn a_lower_limit_lets_the_largest_go() {
+        let mut pool = Pool::new(u64::MAX);
+        for (bytes, name) in [
+            (UPLOAD_CLASS_MIN, "small"),
+            (1 << 20, "mid"),
+            (8 << 20, "big"),
+        ] {
+            assert!(pool.give(upload_class(bytes), name).is_none());
+        }
+        assert_eq!(pool.set_limit(2 << 20), ["big"]);
+        assert_eq!(pool.bytes(), UPLOAD_CLASS_MIN + (1 << 20));
+    }
+}
+
+/// The most bytes of upload buffers kept while no list holds them.
+const UPLOAD_POOL_MOST: u64 = 256 << 20;
+
+/// Upload buffers no list holds: (buffer, mapped data) by capacity class.
+static UPLOAD_POOL: Mutex<Pool<(ID3D12Resource, usize)>> =
+    Mutex::new(Pool::new(UPLOAD_POOL_MOST));
+
+/// An upload buffer of the class covering `size`: one kept
+/// ([`UPLOAD_POOL`]) or a new one. Returns (buffer, data, capacity).
+fn take_upload(host: &Host, size: u64) -> Option<(ID3D12Resource, *mut u8, u64)> {
+    let capacity = upload_class(size);
+    if upload_pool()
+        && let Some((buffer, data)) = UPLOAD_POOL
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take(size)
+    {
+        ALIVE[8].fetch_sub(1, Ordering::Relaxed);
+        ALIVE[9].fetch_sub(capacity, Ordering::Relaxed);
+        ALIVE[10].fetch_add(1, Ordering::Relaxed);
+        return Some((buffer, data as *mut u8, capacity));
+    }
+    let (buffer, data) = host.upload_buffer(capacity)?;
+    Some((buffer, data, capacity))
+}
+
+/// A list is done with `uploads` (it was reset after its submissions ran):
+/// kept for the next list's uploads of their class, or freed past
+/// [`UPLOAD_POOL_MOST`] and without the pool.
+fn give_uploads(uploads: Vec<(ID3D12Resource, u64, usize)>) {
+    if uploads.is_empty() {
+        return;
+    }
+    let mut freed = Vec::new();
+    {
+        let mut pool = UPLOAD_POOL.lock().unwrap_or_else(|e| e.into_inner());
+        for (buffer, capacity, data) in uploads {
+            ALIVE[6].fetch_sub(1, Ordering::Relaxed);
+            ALIVE[7].fetch_sub(capacity, Ordering::Relaxed);
+            let back = if upload_pool() {
+                pool.give(capacity, (buffer, data))
+            } else {
+                Some((buffer, data))
+            };
+            match back {
+                None => {
+                    ALIVE[8].fetch_add(1, Ordering::Relaxed);
+                    ALIVE[9].fetch_add(capacity, Ordering::Relaxed);
+                }
+                Some(item) => freed.push(item.0),
+            }
+        }
+    }
+    drop(freed);
+}
+
 /// A scratch chunk of `size` bytes: one kept ([`SPARE`]) or a new one.
 fn take_chunk(host: &Host, size: u64) -> Option<Chunk> {
     if scratch_pool()
@@ -1738,7 +1965,9 @@ enum Step {
 struct Deferred {
     /// Destination, source, bytes.
     copies: Vec<Step>,
-    uploads: Vec<ID3D12Resource>,
+    /// The upload buffers the list's GPU commands read (buffer, capacity
+    /// class bytes, mapped data): kept until the list is reset, then pooled.
+    uploads: Vec<(ID3D12Resource, u64, usize)>,
     /// The bytes of `uploads` (counted in [`ALIVE`] while they are held).
     upload_bytes: u64,
     /// Host objects the list's commands name (pipelines, root signatures,
@@ -1763,13 +1992,13 @@ struct Deferred {
 }
 
 impl Deferred {
-    /// Holds `buffer` (`size` bytes of upload memory) until the list is
-    /// reset.
-    fn hold_upload(&mut self, buffer: ID3D12Resource, size: u64) {
+    /// Holds `buffer` (`capacity` bytes of upload memory, mapped at `data`)
+    /// until the list is reset.
+    fn hold_upload(&mut self, buffer: ID3D12Resource, capacity: u64, data: usize) {
         ALIVE[6].fetch_add(1, Ordering::Relaxed);
-        ALIVE[7].fetch_add(size, Ordering::Relaxed);
-        self.upload_bytes += size;
-        self.uploads.push(buffer);
+        ALIVE[7].fetch_add(capacity, Ordering::Relaxed);
+        self.upload_bytes += capacity;
+        self.uploads.push((buffer, capacity, data));
     }
 }
 
@@ -4956,6 +5185,15 @@ impl HostList {
         let started = std::time::Instant::now();
         self._alive.used();
         self.release_plane_slots();
+        {
+            // Every submission of the list has run: its upload buffers go to
+            // the pool (or are freed) for the next list, like its chunks.
+            let mut deferred = self.deferred();
+            let uploads = std::mem::take(&mut deferred.uploads);
+            deferred.upload_bytes = 0;
+            drop(deferred);
+            give_uploads(uploads);
+        }
         *self.deferred() = Deferred::default();
         self.states.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.twins.lock().unwrap_or_else(|e| e.into_inner()).clear();
@@ -5503,13 +5741,13 @@ impl HostList {
     }
 
     /// A mapped upload buffer of `size` bytes, alive until the list is
-    /// reset.
-    ///
-    /// shortcut: one buffer per copy; pool them once uploads are frequent.
+    /// reset. Buffers come from and return to [`UPLOAD_POOL`] by capacity
+    /// class (`MESIA_UPLOAD_POOL=0` makes and frees them per list, as before).
     pub(crate) fn upload(&self, host: &Host, size: u64) -> Option<(ID3D12Resource, *mut u8)> {
-        let (buffer, data) = host.upload_buffer(size)?;
+        let (buffer, data, capacity) = take_upload(host, size)?;
         name(&buffer, || format!("list upload {size:#x}"));
-        self.deferred().hold_upload(buffer.clone(), size);
+        self.deferred()
+            .hold_upload(buffer.clone(), capacity, data as usize);
         Some((buffer, data))
     }
 
@@ -5520,11 +5758,12 @@ impl HostList {
         let mut s = self.scratch.lock().unwrap_or_else(|e| e.into_inner());
         let len = len.max(1).next_multiple_of(256);
         if len > SCRATCH_CHUNK {
-            let (buffer, data) = host.upload_buffer(len)?;
+            let (buffer, data, capacity) = take_upload(host, len)?;
             name(&buffer, || format!("list scratch {len:#x}"));
             // SAFETY: a live buffer.
             let gpu = unsafe { buffer.GetGPUVirtualAddress() };
-            self.deferred().hold_upload(buffer, len);
+            self.deferred()
+                .hold_upload(buffer, capacity, data as usize);
             return Some((gpu, data));
         }
         // The chunk in use while `len` fits in what is left of it, else the

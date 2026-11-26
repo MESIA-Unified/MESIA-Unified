@@ -1,5 +1,18 @@
 # Campagne V5.2 — atteindre 4 images traduites distinctes par seconde
 
+## V5.6 — Kelvaroq phase 1.5 (27 novembre, fin)
+
+Baseline `951e4e3`. `upload_pool` porté et intégré (`MESIA_UPLOAD_POOL` défaut
+ON, classes quart-d'octave, limite 256 Mio, recyclage à `reset()` — 135 tests
+verts, soak in-world 0 crash >15 min). Benchmark indépendant `plaincopy` :
+1,5-10× plus rapide que le noyau — mais en jeu il **déclenche le même
+DEVICE_HUNG** que le gating (~3 min, « 5 of 11 ») → **le résiduel latent est
+sensible au timing de préparation** (table 2×2, HANDOFF-ASTRA §V5.6) : c'est
+le bloqueur n°1 de toute optimisation du chemin de soumission. `dirty_ranges`,
+`texel_rows`, `residency` rejetés (redondants — équivalents déjà présents).
+Docs : KELVAROQ-PHASE1-FINAL.md, MEMORY-OPTIMIZATION-RESULTS.md,
+ANIMATION-TRANSITION-VALIDATION.md (fixture spécifiée, à implémenter).
+
 ## V5.5 — Kelvaroq phase 1 (27 novembre, suite)
 
 Baseline `aa9be38`. `plaincopy` porté derrière `MESIA_COPY_PLAIN` (défaut OFF,
