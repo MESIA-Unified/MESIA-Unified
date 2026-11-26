@@ -1,7 +1,26 @@
 # HANDOFF-ASTRA — résiduel DEVICE_HUNG `MESIA_LATE_WAIT=3`
 
-Baseline : `3a46661` (2026-11-26). Charge : `game_scarlett_master.exe`,
-`INPLACE=1`, `WINDOW_KB=1024`, `WIDE_REFRESH/MERGE/BACK=1`, `ASK_ONCE` défaut.
+Baseline : `f8c897c` (2026-11-26) — inclut le fix fences possédées V5.7.
+Charge : `game_scarlett_master.exe`, `INPLACE=1`, `WINDOW_KB=1024`,
+`WIDE_REFRESH/MERGE/BACK=1`, `ASK_ONCE` défaut.
+
+## V5.7 — cause racine candidate trouvée et validée par repro (Devin)
+
+Astra V5.7 (récupéré et vérifié en V5.7.1, commit `f8c897c`) : les opérations
+différées `Late::Signal` / `Held::Wait` / `Held::Signal` détiennent désormais
+un `fence::FenceRef` — avant, elles stockaient l'adresse brute `usize` de la
+fence COM → **UAF** si l'appelant relâchait sa référence avant consommation.
+
+Repro du déclencheur : `MESIA_COPY_PLAIN=1` crashait à ~3 min in-world sous
+l'ancien binaire → **0 hang en ~16 min** sous `f8c897c` (fenêtre ×5 dépassée,
+steady 426-475 ms, copies 90-122 ms/frame). **Preuve forte** que la fence UAF
+était un contributeur majeur du timing-sensible — la fenêtre « relâche →
+consomme » est exactement ce que les lectures plus rapides décalent.
+
+Reste à faire : (a) soak long `COPY_PLAIN=1` pour confirmer, (b) réessayer le
+second déclencheur `defer_host_read` (re-gating externe seulement, jamais
+naïf — voir suspect #3), (c) vérifier si `LATE_WAIT=3` tient maintenant —
+le stage-3 peut être le même UAF exposé par un timing différent.
 
 ## V5.6 — donnée nouvelle : le crash est aussi atteignable sous `LATE_WAIT=2`
 

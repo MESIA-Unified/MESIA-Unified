@@ -243,3 +243,13 @@ barrières present, `Step::Host` non gaté, ou drop COM bypassant `retire`.
 `submitted` (plan détaillé dans le rapport B2, risque B), fetch card_back
 send-tôt/wait-tard (~20-80 ms), merges u8→u64, `MESIA_RELAY=1` à re-tester
 maintenant que v2/v3 sont en place, `MESIA_LATE_WAIT_LISTS` réglage.
+
+## 26 novembre 2026 (soir) — V5.7.1 : récupération Astra — fences possédées ; repro `COPY_PLAIN` en test
+
+**Base `29a151e`.** Session Codex interrompue par quota ; travail trouvé non commité dans `mesia-main` (ni branche `campaign/v5.7` ni commits `a7e3372`/`ace72fb` n'existent — références Codex jamais réalisées localement).
+
+- **Récupéré et vérifié** : `fence::FenceRef` (add_ref/Drop release, Send) ; `Late::Signal` et `Held::Wait/Signal` détiennent désormais la fence jusqu'à l'atterrissage ou l'annulation — avant, les ops différées stockaient l'adresse brute (UAF possible si l'appelant relâchait tôt). `late_signal` unsafe. Instrumentation `acquiring`/`lock` proprement sous `diagnostics`. Benchmark plaincopy renforcé (conformité entre chemins).
+- **Vérifié** : `cargo check` propre, **138 tests verts** dont les 3 tests Astra de durée de vie (retain-until-wait, caller-release, cancel-without-signal).
+- **Hypothèse active** : l'UAF de fence différée est un candidat de cause racine du résiduel timing-sensible — les déclencheurs (plaincopy, gating) accélèrent la préparation et décalent la fenêtre relâche/consomme.
+- **Test en cours** : run repro `MESIA_COPY_PLAIN=1` (crashait ~3 min sous l'ancien binaire) sous le nouveau.
+- **Commits** : `f8c897c` (récupération code), `4bf43f1` (docs dérivés + wer.ps1). Rapport : `docs/ASTRA-V57-RECOVERY-REPORT.md`.
