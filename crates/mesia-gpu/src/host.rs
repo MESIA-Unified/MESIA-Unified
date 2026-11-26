@@ -818,6 +818,10 @@ pub(crate) struct HostList {
     /// What the list does with depth textures that have a colour twin, by
     /// twin ([`TwinUse`]).
     twins: Mutex<std::collections::HashMap<usize, TwinUse>>,
+    /// Dynamic view-heap slots the list's depth-plane passes leased
+    /// (`record_plane_pass`), given back once every submission of the
+    /// list ran — as the table slots of a draw state are.
+    plane_slots: Mutex<Vec<(usize, u32, u32)>>,
     /// The list that runs those transitions just before this one, made
     /// when the list first has such transitions ([`lazy_prelude`]).
     prelude: OnceLock<Option<Prelude>>,
@@ -1099,14 +1103,14 @@ impl PlanePass {
     }
 }
 
-/// Records into `list` the pass that draws `plane`, the twin of the depth
-/// plane of `depth`, into that plane: `depth` in the depth-write state,
-/// `plane` readable by pixel shaders. The pass sets the list's descriptor
-/// heap, graphics root signature, pipeline, depth target, viewport,
-/// scissor and topology and puts none of them back: it is for a list that
-/// records nothing of the title's after it.
+/// Records into `list`'s command list the pass that draws `plane`, the
+/// twin of the depth plane of `depth`, into that plane: `depth` in the
+/// depth-write state, `plane` readable by pixel shaders. The pass sets
+/// the list's descriptor heap, graphics root signature, pipeline, depth
+/// target, viewport, scissor and topology and puts none of them back: it
+/// is for a list that records nothing of the title's after it.
 fn record_plane_pass(
-    list: &ID3D12GraphicsCommandList,
+    list: &HostList,
     depth: &ID3D12Resource,
     plane: &ID3D12Resource,
 ) {
@@ -1127,9 +1131,44 @@ fn record_plane_pass(
     let Some((root, pipeline)) = pass.pipeline(steps, format) else {
         return;
     };
-    for slice in 0..u32::from(of.DepthOrArraySize) {
-        for mip in 0..u32::from(of.MipLevels) {
-            let slot = pass.next.fetch_add(1, Ordering::Relaxed) % PLANE_VIEWS;
+    let (slices, mips) = (u32::from(of.DepthOrArraySize), u32::from(of.MipLevels));
+    // The views the pass binds must stay what it writes until the list
+    // has run: the ring below comes round while flights still read the
+    // slots it rewrites (a descriptor an in-flight list's shader catches
+    // mid-write hangs the device), so the slots are leased from a view
+    // heap's dynamic run and given back once the list's submissions have
+    // all run — as the table slots of a draw state are.
+    let lease = crate::descriptor::view_heap()
+        .and_then(|(heap, view_heap)| {
+            view_heap
+                .dynamic(slices * mips)
+                .map(|first| (heap, view_heap, first))
+        })
+        .map(|(heap, view_heap, first)| {
+            list.plane_slots
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push((std::ptr::from_ref(heap) as usize, first, slices * mips));
+            (view_heap, first)
+        });
+    // Without a lease the pass falls back to the ring: a flight in the
+    // air could catch its writes, so flights are settled and submissions
+    // are kept out until the slots are made. With the flights machinery
+    // off a submission can still be running while this list records
+    // (lists record on many threads): the pass is then dropped, not the
+    // card.
+    let hold = lease.is_none().then(settle_and_hold).flatten();
+    if lease.is_none() && hold.is_none() && in_air(current_submission()) {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| {
+            tracing::warn!(
+                "no descriptor slots for a depth-plane pass while a submission runs: the pass is dropped"
+            )
+        });
+        return;
+    }
+    for slice in 0..slices {
+        for mip in 0..mips {
             let view = D3D12_SHADER_RESOURCE_VIEW_DESC {
                 Format: DXGI_FORMAT(if steps { 57 } else { 41 }),
                 ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2DARRAY,
@@ -1158,23 +1197,39 @@ fn record_plane_pass(
             };
             let target = host.dsv(depth, Some(&target));
             let (width, height) = ((of.Width >> mip).max(1) as u32, (of.Height >> mip).max(1));
-            let cpu = D3D12_CPU_DESCRIPTOR_HANDLE {
-                ptr: pass.cpu + (slot * pass.step) as usize,
-            };
-            let gpu = D3D12_GPU_DESCRIPTOR_HANDLE {
-                ptr: pass.gpu + u64::from(slot * pass.step),
-            };
-            // SAFETY: an open list; a slot of our heap; live resources and
-            // objects (the pass's own live as long as the process).
+            let k = slice * mips + mip;
+            // SAFETY: an open list; a slot of the heap it binds, written
+            // just before the bind; live resources and objects (the
+            // pass's own live as long as the process).
             unsafe {
-                host.device
-                    .CreateShaderResourceView(plane, Some(&view), cpu);
-                list.SetDescriptorHeaps(&[Some(pass.views.clone())]);
-                list.SetGraphicsRootSignature(&root);
-                list.SetPipelineState(&pipeline);
-                list.SetGraphicsRootDescriptorTable(0, gpu);
-                list.OMSetRenderTargets(0, None, false, Some(&target));
-                list.RSSetViewports(&[D3D12_VIEWPORT {
+                let gpu = match lease {
+                    Some((view_heap, first)) => {
+                        let index = first + k;
+                        view_heap.srv_at(index, plane, &view);
+                        list.list
+                            .SetDescriptorHeaps(&[Some(view_heap.heap.clone())]);
+                        view_heap.gpu_handle(index)
+                    }
+                    None => {
+                        let slot = pass.next.fetch_add(1, Ordering::Relaxed) % PLANE_VIEWS;
+                        host.device.CreateShaderResourceView(
+                            plane,
+                            Some(&view),
+                            D3D12_CPU_DESCRIPTOR_HANDLE {
+                                ptr: pass.cpu + (slot * pass.step) as usize,
+                            },
+                        );
+                        list.list.SetDescriptorHeaps(&[Some(pass.views.clone())]);
+                        D3D12_GPU_DESCRIPTOR_HANDLE {
+                            ptr: pass.gpu + u64::from(slot * pass.step),
+                        }
+                    }
+                };
+                list.list.SetGraphicsRootSignature(&root);
+                list.list.SetPipelineState(&pipeline);
+                list.list.SetGraphicsRootDescriptorTable(0, gpu);
+                list.list.OMSetRenderTargets(0, None, false, Some(&target));
+                list.list.RSSetViewports(&[D3D12_VIEWPORT {
                     TopLeftX: 0.0,
                     TopLeftY: 0.0,
                     Width: width as f32,
@@ -1182,20 +1237,21 @@ fn record_plane_pass(
                     MinDepth: 0.0,
                     MaxDepth: 1.0,
                 }]);
-                list.RSSetScissorRects(&[RECT {
+                list.list.RSSetScissorRects(&[RECT {
                     left: 0,
                     top: 0,
                     right: width as i32,
                     bottom: height as i32,
                 }]);
-                list.IASetPrimitiveTopology(
+                list.list.IASetPrimitiveTopology(
                     windows::Win32::Graphics::Direct3D::D3D_PRIMITIVE_TOPOLOGY(4),
                 );
-                list.DrawInstanced(3, 1, 0, 0);
+                list.list.DrawInstanced(3, 1, 0, 0);
             }
             crate::resource::PLANES[0].fetch_add(1, Ordering::Relaxed);
         }
     }
+    drop(hold);
 }
 
 /// Records into `list` the copy of a depth texture into its colour twin
@@ -2991,6 +3047,7 @@ impl Host {
                 scratch: Mutex::default(),
                 states: Mutex::default(),
                 twins: Mutex::default(),
+                plane_slots: Mutex::default(),
                 prelude,
                 pipelines: Mutex::default(),
                 budget: OnceLock::new(),
@@ -4851,12 +4908,29 @@ impl HostList {
         }
     }
 
+    /// Gives back the dynamic view-heap slots the list's depth-plane
+    /// passes leased (`plane_slots`). For after every submission of the
+    /// list ran — `reset` or drop, as `draw::State::tables_done` and its
+    /// `Drop` give a list's table slots back.
+    fn release_plane_slots(&self) {
+        let slots = std::mem::take(
+            &mut *self
+                .plane_slots
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()),
+        );
+        for (heap, first, n) in slots {
+            crate::descriptor::release_dynamic(heap, first, n);
+        }
+    }
+
     /// Only after the list's last submission finished (every one is waited
     /// for).
     pub(crate) fn reset(&self) {
         #[cfg(feature = "diagnostics")]
         let started = std::time::Instant::now();
         self._alive.used();
+        self.release_plane_slots();
         *self.deferred() = Deferred::default();
         self.states.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.twins.lock().unwrap_or_else(|e| e.into_inner()).clear();
@@ -5034,7 +5108,7 @@ impl HostList {
         let Some(plane) = &twin.plane else { return };
         self.settle(depth, DEPTH_WRITE);
         self.settle(plane, PIXEL_SHADER_RESOURCE);
-        record_plane_pass(&self.list, &depth.texture, &plane.texture);
+        record_plane_pass(self, &depth.texture, &plane.texture);
         self.settle(plane, UNORDERED_ACCESS);
     }
 
@@ -5631,6 +5705,18 @@ impl HostList {
             };
             PREPARING[0].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
             PREPARING[1].fetch_add(copied as u64, Ordering::Relaxed);
+        }
+    }
+}
+
+impl Drop for HostList {
+    /// A host list that flies drops after it lands, and a recorded one the
+    /// title throws away drops unsubmitted: the view-heap slots its
+    /// depth-plane passes leased go back in both cases.
+    fn drop(&mut self) {
+        let slots = self.plane_slots.get_mut().unwrap_or_else(|e| e.into_inner());
+        for (heap, first, n) in slots.drain(..) {
+            crate::descriptor::release_dynamic(heap, first, n);
         }
     }
 }

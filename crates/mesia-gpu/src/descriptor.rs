@@ -168,6 +168,26 @@ fn mirror(handle: u64) {
     }
 }
 
+/// A title view heap and its host heap, for work of ours outside the
+/// title's tables that needs descriptor slots a list can lease
+/// (the depth-plane pass's views — `crate::host::record_plane_pass`).
+/// The title `Heap` comes back for [`release_dynamic`].
+#[cfg(windows)]
+pub(crate) fn view_heap() -> Option<(&'static Heap, &'static host::HostHeap)> {
+    let heaps = SHADER_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
+    for &(_, _, at) in heaps.iter() {
+        // SAFETY: registered heaps are live (removed when dropped).
+        let heap = unsafe { &*(at as *const Heap) };
+        if heap.samplers() {
+            continue;
+        }
+        if let Some(host) = heap.host.get().and_then(|h| h.as_ref()) {
+            return Some((heap, host));
+        }
+    }
+    None
+}
+
 /// Gives back dynamic slots of the host heap behind the title heap at
 /// `heap`, if that heap still exists.
 #[cfg(windows)]

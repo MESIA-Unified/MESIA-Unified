@@ -1265,6 +1265,24 @@ impl HostHeap {
         self.keep(index, None);
     }
 
+    /// Makes slot `index` (a dynamic one) the view `desc` describes of
+    /// `resource`, for a view of ours `make_at`'s `View` does not cover
+    /// (the depth-plane pass's float views of a typeless twin).
+    pub(crate) fn srv_at(
+        &self,
+        index: u32,
+        resource: &ID3D12Resource,
+        desc: &D3D12_SHADER_RESOURCE_VIEW_DESC,
+    ) {
+        let Some(host) = host() else { return };
+        // SAFETY: a slot of our heap and a live resource.
+        unsafe {
+            host.device
+                .CreateShaderResourceView(resource, Some(desc), self.cpu(index))
+        };
+        self.keep(index, Some(resource.clone()));
+    }
+
     /// Makes slot `index` (a dynamic one) a raw unordered access view of
     /// `len` bytes of `buffer` from byte `offset` (a multiple of 16): a
     /// root UAV with a size, whose accesses past it do nothing instead of
