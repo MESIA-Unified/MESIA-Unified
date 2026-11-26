@@ -1,5 +1,33 @@
 # MESIA — Étude d'optimisation mesia-gpu
 
+## Baseline graphique V5.2 du 26 novembre 2026
+
+Windows 11, RTX 3060 12 Go, pilote 617.14, release MSVC, un job de compilation terminé avant les tests. Chaque processus ouvre une fenêtre 128 × 64 et rend deux triangles magenta sur fond noir. Le buffer de sommets change à chaque image. La référence GFX10 construit ses propres signatures et métadonnées, puis fait passer **le VS et le PS** par `emit::translate` et le validateur DXIL du SDK. Le mode PC compile deux entrées HLSL originales avec DXC. Les deux modes utilisent le même PSO graphique par configuration, le même oracle CPU et la même boucle de présentation.
+
+Après 8 images d’échauffement, chacune des 64 soumissions doit terminer sa fence, reproduire exactement les 8 192 pixels prévus à une position unique et obtenir `S_OK` pour ce même back buffer. La fence précède la réécriture du VB, la réinitialisation de l’allocateur et la lecture des résultats. Le heap RTV, les deux buffers DXGI et les ressources de lecture restent vivants jusqu’à la fin. Trois timestamps GPU encadrent le dessin et la copie. `Present(1, 0)` utilise la synchronisation verticale. L’observation des IDs via `GetFrameStatistics` continue jusqu’au dernier ID ou pendant 250 ms supplémentaires. Un ID manqué reste inconnu. La borne en dernière colonne inclut cette fenêtre supplémentaire.
+
+| Passage | Shaders | Moy. ms | P50 ms | P95 ms | P99 ms | Images correctes acceptées/s | IDs affichés observés | Borne affichée/s |
+|---|---|---:|---:|---:|---:|---:|---:|---:|
+| 1 | GFX10 traduit | 6.9473 | 6.9432 | 7.0698 | 7.2172 | 143.937 | 63/64 | 90.693 |
+| 2 | PC natif | 6.9444 | 6.9104 | 7.1767 | 7.2563 | 143.997 | 63/64 | 90.554 |
+| 3 | PC natif | 6.9473 | 6.9472 | 7.0577 | 7.1450 | 143.938 | 63/64 | 112.339 |
+| 4 | GFX10 traduit | 6.9463 | 6.9328 | 7.1457 | 7.2919 | 143.959 | 63/64 | 90.510 |
+| 5 | GFX10 traduit | 6.9451 | 6.9472 | 7.0917 | 7.2749 | 143.982 | 64/64 | 137.249 |
+| 6 | PC natif | 6.9443 | 6.9391 | 7.1287 | 7.1595 | 144.001 | 62/64 | 89.179 |
+
+Sur les trois passages traduits, initialisation D3D12 176,4–182,3 ms, construction et traduction des conteneurs 0,65–1,04 ms, validation 1,59–1,64 ms, création du PSO 0,50–0,54 ms, fenêtre et ressources 29,4–59,3 ms, échauffement 49,1–52,1 ms. Les caches du pilote étaient conservés. Les trois compilations HLSL de référence ont pris 34,1–36,0 ms par paire.
+
+En régime établi, moyennes par image traduite : préparation CPU et soumission 0,090–0,101 ms de temps mural, attente de fence 6,61–6,64 ms, vérification CPU 0,0165–0,0173 ms, appel Present 0,195–0,212 ms, rendu GPU 0,0022–0,0023 ms et copie GPU 0,0029 ms. Le compteur de temps CPU du processus n’a pas avancé à sa résolution sur ces fenêtres courtes. La copie du back buffer et la vérification exhaustive font partie de la mesure. La résolution des timestamps et les requêtes DXGI ajoutent aussi du travail. L’attente synchrone sous cadence écran domine cette fixture. Elle ne chiffre pas les économies potentielles du moteur sur plusieurs milliers de draws.
+
+Fin des passages traduits : working set et pic du processus 74 Mio, mémoire GPU locale attribuée 11 Mio et non locale 26 Mio, RAM système disponible 8 255–8 277 Mio, engagement 13 591–13 616 Mio pour une limite de 65 368 Mio. Chaque passage a réussi les contrôles DXIL, PSO, fence, pixels et HRESULT. La stabilité observée porte sur ces courtes séries.
+
+Depuis PowerShell dans la racine du projet, lancer un seul processus sur le bureau interactif. Pour la comparaison PC, fixer `MESIA_GRAPHICS_NATIVE=1` et éventuellement `MESIA_PC_DXC`. Le mode par défaut sélectionne les shaders traduits.
+
+```powershell
+cargo test --release --locked -j 1 -p mesia-shader --features host --test translated_graphics --no-run
+cargo test --release --locked -j 1 -p mesia-shader --features host --test translated_graphics -- --ignored --exact translated_graphics_baseline --test-threads=1 --nocapture
+```
+
 > [English below](#english-version) · Mesures : RTX 3060 12 Go, 16 Go RAM, runs du 2026-11-25.
 
 ## État mesuré (combo env validé)

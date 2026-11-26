@@ -1,5 +1,22 @@
 # Session autonome — notes de travail (2026-11-25)
 
+## 26 novembre 2026 — passation à Devin
+
+Le point de reprise est figé dans [HANDOFF-DEVIN.md](HANDOFF-DEVIN.md). Le miroir Git local est propre à `293b8a4`. La campagne vit dans `mesia-main` et sa sauvegarde de sources. La comparaison des arbres a identifié une différence de casse dans le chemin du document d’architecture. Les preuves de référence restent les six passages graphiques release, le test du compteur et les validations VALU/compute déjà consignées. Le premier travail de Devin est de qualifier le replay avant de choisir une optimisation. Cette intervention est une passation documentaire et une sauvegarde, sans nouvelle compilation ni exécution GPU.
+
+## Campagne V5.2 — reprise du 26 novembre
+
+**Résultat Astra, postérieur aux notes Sol ci-dessous.** Le rectangle animé original parcourt VS et PS GFX10 → `emit::translate` → validation DXIL → dessin D3D12 → fence → comparaison complète du back buffer → présentation DXGI. Trois runs release traduits et trois PC natifs réussis. 192/192 images traduites acceptées, 190 IDs distincts observés à l’affichage. 143,94–143,98 présentations correctes/s sur cette fixture minimale synchronisée. Le compteur hôte exclut aussi l’occlusion DXGI. Le test ciblé injectant échec, occlusion et succès passe sans soumission GPU. Les deux agents ont épuisé leur quota après écriture des modules, l’orchestrateur a intégré et exécuté la suite. Détails et protocole dans [docs/perf-study.md](docs/perf-study.md). Le test graphique a franchi le jalon architectural. Les paliers sur replay représentatif restent ouverts pour Sol.
+
+- 17/17 tests VALU GFX10 synthétiques exécutés séquentiellement et réussis dans la mission précédente. Référence HLSL native à deux images réussie sur WARP. Ce ne sont pas des FPS du chemin traduit.
+- Au démarrage de cette vague : GPU 1–3 %, 11,3 Gio environ de VRAM libres, 8,38 Gio de RAM libre, aucun processus Cargo actif. Un seul build ou test GPU est lancé à la fois.
+- P0 corrigé dans `mesia-gpu/src/host.rs` : le résultat de `Present` est maintenant vérifié avant que `Meter::frame` ne compte une image. `cargo check --locked -j 1 -p mesia-gpu` passe ; le binaire de tests GPU est construit par `cargo test --locked -j 1 -p mesia-gpu --lib --no-run`. L’échec de `Present` n’a pas encore été provoqué par une fixture.
+- Audit B/E ciblé en lecture seule : `declared_writes` cherche linéairement un shadow dans le vecteur de résultats pour chaque nouvelle plage. Une table d’indices pourrait réduire ce coût après mesure. Aucune optimisation de ce chemin n’est encore appliquée.
+- Agent A travaille exclusivement dans `crates/mesia-shader/src/emit/mod.rs` à une fixture originale de traduction graphique, readback et images distinctes. La construction d’un conteneur graphique pour `emit::translate` sans compilateur console est la difficulté actuelle. Aucun FPS effectif établi à cette étape.
+- Étape A livrée : conteneur GFX10 compute original sérialisé en Rust, traversant `emit::translate`. Huit dispatchs donnent 1..8 au readback, tous corrects sur RTX 3060. Release, trois répétitions sans compilation : P50 21,887 / 22,276 / 21,593 ms et maximum 37,546 / 24,517 / 27,409 ms. Le temps inclut création de ressources, soumission, attente et lecture. Aucune image graphique ou présentation DXGI ; ne convertir aucun de ces chiffres en FPS effectif.
+- `cargo check --locked -j 1 -p mesia-gpu` et `cargo test --locked -j 1 -p mesia-gpu --lib --no-run` passent après le contrôle HRESULT de `Present`. La fixture traduite passe en debug et release. Un `cargo fmt --all -- --check` global signale de nombreux écarts antérieurs, sans écriture de fichier.
+- Prochain chantier concret : fixture graphique originale avec VS/PS GFX10, géométrie animée, comparaison CPU et HLSL PC, readback et `Present`. La sérialisation de l’export vertex et l’intégration DXGI dépassent le petit test compute. Recommander GPT-6.2 Astra pour cette étape architecturale si elle bloque la campagne.
+
 ## État live
 - Run courant : mode 2 (défaut) + `MESIA_D3D12_DRED=1 MESIA_GPU_TIMING=1`, binaire avec fix échange-pair — en gameplay (prompt L/R affiché), veille crash.
 - 5 TDR `nvlddmkm` ID 153 : 11:22, 12:04, 12:37, 12:44 UTC. Runs longs (60+ min) sans crash → **stochastique**.

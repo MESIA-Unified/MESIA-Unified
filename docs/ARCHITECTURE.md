@@ -35,7 +35,7 @@ Converting them ahead of time from files is only a warm-up.
 | `mesia-hle` | console API implementations, host pass-through policy |
 | `mesia-gpu` | D3D12.X objects, command lists and GPU memory → host D3D12 |
 | `mesia-shader` | Xbox shader containers → host shaders |
-| `mesia-formats` | the GPU's texture layouts (sizes, tiling, detiling), audio codecs; planned: BCPack |
+| `mesia-formats` | GPU texture layouts (sizes, tiling, detiling), BCPack decoding and audio codecs |
 | `mesia-pipeline` | converter trait, content-addressed cache |
 | `mesia-game` | the title-specific formats, build identities, hooks |
 | `apps/mesia` | command-line front end |
@@ -97,3 +97,20 @@ the lanes take, from structurisation), and accessed with a non-uniform heap
 index in one pass. `mesia translate`
 runs every shader it finds (containers, SGD5 files) through these and
 lists what they cannot handle yet.
+
+## From a command list to a presented frame
+
+Paths below are relative to `crates/mesia-gpu/src/` unless qualified.
+
+| Stage | Source and responsibility |
+|---|---|
+| Startup | `apps/mesia/src/run.rs` reads configuration, prepares the image, configures caches and binds imports. Execution requires `--execute`. `mesia-hle/src/modules/d3d12x.rs` exposes the graphics entry points. |
+| Device and memory | `device.rs` implements title-facing objects. `host.rs` initializes the DXGI/D3D12 host. `resource.rs` handles heaps and placed resources. `memory.rs` maps raw shader addresses through a directory and UAV slots. |
+| Record and bind | `list.rs` and `draw.rs` record commands and bindings. `descriptor.rs` and `descriptor/host.rs` map title descriptors to host heaps. Keeping a resource alive and keeping its descriptor contents stable until fence completion are separate obligations. |
+| Submit and retire | `queue.rs` hands lists to `host.rs`. The host tracks transitions, allocators, submitted work, fences and deferred retirement. `fence.rs` implements title-visible fences. Audit uploads, descriptor writes and allocator resets against the last consumer. |
+| Transfers | `watch.rs` tracks modified pages, `shadow.rs` reconciles title and host buffers, `texture.rs` stages texture refreshes and `inplace.rs` handles eligible placements. Verify both upload and GPU-to-CPU copy-back. |
+| Translate | In `mesia-shader/src/`, `gfx10/`, `ir.rs`, `structure.rs` and `resource.rs` decode operations, build SSA, reconstruct lane control flow and track bindings. `emit/lower.rs`, `emit/bitcode.rs` and `emit/container.rs` produce DXIL. `emit/validator.rs` uses the DXIL validator. Differential tests can invoke DXC on original HLSL. |
+| Cache and compile | `shader_cache.rs` uses `mesia-pipeline/src/cache.rs` for translated shaders. Its key covers input, executable fingerprint and translation settings including host wave width. Keep serialization and cache keys in step with semantics. `pipeline/make.rs` schedules builds, `pipeline/host.rs` creates root signatures and PSOs, and `pipeline/library.rs` persists the host pipeline library. Record shader hits and PSO readiness separately. |
+| Present and diagnose | `queue.rs` counts title presentation requests. In `host.rs`, the host meter advances when DXGI returns `S_OK`. `frame.rs` handles pacing and `copystat.rs` tracks transfers. GPU timings and failure breadcrumbs live in `host.rs`. The graphics benchmark matches sampled DXGI display IDs to accepted presents and verifies the back buffer before each present. |
+
+The crate paths `mesia-hle/src/`, `mesia-shader/src/` and `mesia-pipeline/src/` in this table start under `crates/`. GPU incident reports in `docs/` describe the revision named in each report. Check the current implementation and CHANGELOG.md before reopening a historical finding.

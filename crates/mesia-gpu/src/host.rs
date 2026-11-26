@@ -6135,6 +6135,19 @@ impl Meter {
         }
     }
 
+    /// DXGI can report a successful status while the window is occluded.
+    /// Only S_OK indicates an accepted presentation for this counter.
+    fn record_present(&mut self, hwnd: HWND, result: windows::core::HRESULT) -> bool {
+        if result.0 != 0 {
+            if let Err(error) = result.ok() {
+                tracing::warn!(error = %error, "swap chain present failed");
+            }
+            return false;
+        }
+        self.frame(hwnd);
+        true
+    }
+
     /// Counts a presented frame.
     fn frame(&mut self, hwnd: HWND) {
         #[cfg(feature = "diagnostics")]
@@ -6459,8 +6472,9 @@ impl Host {
             if let Some((buffer, footprint)) = capture {
                 crate::capture::save_read_back(frame, &buffer, &footprint);
             }
-            let _ = p.swap_chain.Present(0, DXGI_PRESENT(0));
-            p.meter.frame(p.hwnd);
+            if !p.meter.record_present(p.hwnd, p.swap_chain.Present(0, DXGI_PRESENT(0))) {
+                return None;
+            }
             #[cfg(feature = "diagnostics")]
             return Some(probe.is_some_and(|b| crate::capture::black(&b)));
             #[cfg(not(feature = "diagnostics"))]
@@ -6512,6 +6526,20 @@ impl Host {
             })
         }
     }
+}
+
+#[cfg(test)]
+#[test]
+fn failed_and_occluded_presents_do_not_advance_the_meter() {
+    use windows::Win32::Foundation::{DXGI_STATUS_OCCLUDED, E_FAIL, S_OK};
+
+    let mut meter = Meter::new();
+    let hwnd = HWND::default();
+    assert!(!meter.record_present(hwnd, E_FAIL));
+    assert!(!meter.record_present(hwnd, DXGI_STATUS_OCCLUDED));
+    assert_eq!(meter.frames, 0);
+    assert!(meter.record_present(hwnd, S_OK));
+    assert_eq!(meter.frames, 1);
 }
 
 /// A visible top-level window of this process: the one the title made, if

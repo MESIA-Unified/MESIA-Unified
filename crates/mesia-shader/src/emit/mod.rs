@@ -760,6 +760,129 @@ mod tests {
     use super::lower::LOOP_LIMIT;
     use super::parse_loop_limit;
 
+    /// A small original GFX10 fixture, serialized through the same
+    /// XDAT/XBCH/FSSM format that `translate` reads in production.
+    /// Its one lane writes the frame number to a raw UAV.
+    #[cfg(windows)]
+    fn translated_frame_shader() -> super::HostShader {
+        use crate::dxbc::{FourCC, build};
+
+        let words = [
+            0xBE85_0380u32, // s_mov_b32 s5, 0
+            0xF408_0202,    // s_load_dwordx4 s[8:11], s[4:5], 0
+            0xFA00_0000,    // continuation of the scalar load
+            0x7E00_0200,    // v_mov_b32 v0, s0
+            0xE070_0000,    // buffer_store_dword v0, off, s[8:11], 0
+            0x8002_0000,
+            0xBF81_0000, // s_endpgm
+        ];
+        let code: Vec<u8> = words.iter().flat_map(|word| word.to_le_bytes()).collect();
+        let mut payload = vec![0u8; 0x68];
+        payload[..8].copy_from_slice(&6u64.to_le_bytes());
+        for slot in [0x08, 0x10, 0x18, 0x20, 0x28, 0x30, 0x48, 0x60] {
+            payload[slot..slot + 8].copy_from_slice(&0xDEAD_BEEF_DEAD_BEEFu64.to_le_bytes());
+        }
+        let record = payload.len();
+        payload[0x60..0x68].copy_from_slice(&(record as u64).to_le_bytes());
+        let stage_data_len = 0x34usize;
+        let code_at = record + 0x54 + stage_data_len;
+        let layout_at = code_at + code.len();
+        let used_at = layout_at + 40;
+        payload.resize(record + 0x54 + stage_data_len, 0);
+        payload[record..record + 8].copy_from_slice(&(code_at as u64).to_le_bytes());
+        payload[record + 8..record + 16].copy_from_slice(&(code.len() as u64).to_le_bytes());
+        payload[record + 0x14..record + 0x18].copy_from_slice(&32u32.to_le_bytes());
+        payload[record + 0x28..record + 0x30].copy_from_slice(&(layout_at as u64).to_le_bytes());
+        payload[record + 0x30..record + 0x38].copy_from_slice(&(used_at as u64).to_le_bytes());
+        payload[record + 0x38..record + 0x3c].copy_from_slice(&2u32.to_le_bytes());
+        payload[record + 0x3c..record + 0x40].copy_from_slice(&1u32.to_le_bytes());
+        payload[record + 0x50..record + 0x54].copy_from_slice(&(8u32 | (12 << 20)).to_le_bytes());
+        payload[record + 0x54 + 0x24..record + 0x54 + 0x28]
+            .copy_from_slice(&10u32.to_le_bytes()); // five user SGPRs
+        payload[record + 0x54 + 0x28..record + 0x54 + 0x34]
+            .copy_from_slice(&[1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0]);
+        payload.extend_from_slice(&code);
+        let mut constant_root = [0u8; 20];
+        constant_root[8..12].copy_from_slice(&4u32.to_le_bytes());
+        payload.extend_from_slice(&constant_root);
+        let mut table_root = [0u8; 20];
+        table_root[0..4].copy_from_slice(&3u32.to_le_bytes());
+        table_root[8..12].copy_from_slice(&1u32.to_le_bytes());
+        table_root[16] = 4;
+        table_root[17] = 1;
+        payload.extend_from_slice(&table_root);
+        let mut used = [0u8; 20];
+        used[0] = 3; // UAV
+        used[1] = 3; // table
+        used[16] = 4;
+        used[17] = 4;
+        used[18] = 1;
+        payload.extend_from_slice(&used);
+
+        let mut fssm = b"FSSM".to_vec();
+        fssm.extend_from_slice(&0x101u32.to_le_bytes());
+        fssm.extend_from_slice(&(payload.len() as u64).to_le_bytes());
+        fssm.extend_from_slice(&payload);
+        let packed = miniz_oxide::deflate::compress_to_vec_zlib(&fssm, 6);
+        let mut xbch = b"XBCH".to_vec();
+        xbch.extend_from_slice(&3u32.to_le_bytes());
+        xbch.extend_from_slice(&(packed.len() as u64).to_le_bytes());
+        xbch.extend_from_slice(&(fssm.len() as u64).to_le_bytes());
+        xbch.extend_from_slice(&packed);
+        let mut dxil = vec![0u8; 0x18];
+        dxil.extend_from_slice(b"XDAT");
+        dxil.extend_from_slice(&1u32.to_le_bytes());
+        dxil.extend_from_slice(&0x24u32.to_le_bytes());
+        dxil.extend_from_slice(&13u32.to_le_bytes());
+        dxil.extend_from_slice(&0x30u32.to_le_bytes());
+        dxil.extend_from_slice(&(xbch.len() as u32).to_le_bytes());
+        dxil.extend_from_slice(&xbch);
+        super::translate(&build(&[(FourCC::DXIL, &dxil)]))
+            .expect("original GFX10 frame fixture must translate")
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn original_translated_frames_match_their_cpu_reference() {
+        use super::host::{Dispatch, Host, Root, View};
+
+        let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap();
+        let shader = translated_frame_shader();
+        let host = Host::new(false).expect("hardware SM 6.6 device required");
+        let (root, pso) = host.compute_pipeline(&shader).expect("translated pipeline");
+        let mut elapsed = Vec::new();
+        for frame in 1..=8u32 {
+            let mut user_data = vec![0u32; shader.user_data_dwords().max(1) as usize];
+            for entry in &shader.user_data {
+                user_data[entry.index as usize] = match (entry.root, entry.slot) {
+                    (crate::RootType::Constants, 0) => frame,
+                    (crate::RootType::Table, 1) => 0,
+                    other => panic!("unexpected root {other:?}"),
+                };
+            }
+            let start = std::time::Instant::now();
+            let out = host
+                .dispatch(
+                    &root,
+                    &pso,
+                    &Dispatch {
+                        roots: vec![(0, Root::Constants(user_data))],
+                        views: &[View::RawUav(1)],
+                        samplers: &[],
+                        groups: [1, 1, 1],
+                    },
+                )
+                .expect("translated frame readback");
+            elapsed.push(start.elapsed().as_secs_f64() * 1000.0);
+            assert_eq!(out, vec![vec![frame]], "frame {frame} must be fresh");
+        }
+        elapsed.sort_by(f64::total_cmp);
+        eprintln!(
+            "translated synthetic frames: 8 correct, p50 {:.3} ms, p95 {:.3} ms, max {:.3} ms",
+            elapsed[3], elapsed[7], elapsed[7]
+        );
+    }
+
     #[test]
     fn the_clean_up_switch_parses_or_runs_every_pass() {
         let all = super::bitcode::opt::ALL;
