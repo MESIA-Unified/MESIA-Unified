@@ -193,3 +193,32 @@ terminaux. Lock soumission tenu = rejeté (host_copy -> host.execute = deadlock)
 **Prochain** : audit du cycle upload-memory / `execute_own` / `Step::Host`
 sous flights stage 3, ou handoff GPT-6.2 Astra. Paliers : ~2 fps stable ✓
 (flats de ~410 ms observés = proche du palier 2,5 fps sur scènes légères).
+
+## V5.3 session — audits + fixes transferts (Devin)
+
+**Baseline** : `467839b` → `3a46661`. 3 audits read-only menés (stability A3,
+waits B2, transferts C1) — comptes-rendus intégrés dans les commits.
+
+**Livré `3a46661`** :
+- `copy.keep(texture)` : le vol present ne retenait pas la ressource source —
+  hazard réel (audit A3 confirme l'étanchéité du fix). Stage 3 crash quand même
+  : ce n'était PAS le crashur, mais le fix est nécessaire.
+- Double `settle_for_present` supprimé sous `forces()` (1 drain/frame évité ;
+  chemin `MESIA_WAIT_FORCE=0` conservé).
+- `Step::Texture` couvert par `MESIA_ASK_ONCE` : les checks textures payaient
+  un `GetWriteWatch` chacun, plusieurs fois par soumission. Mesuré : textures
+  **7,9 ms/frame** (vs 50-310 ms avant). Même sémantique, fallback intact.
+
+**Mesures V5.3** (LATE_WAIT=2, in-world ~3 min, 0 crash) : 444-512 ms,
+P50=405 ms sur la session précédente ; preparing: copies 93,7 ms/201 Mo,
+textures 7,9 ms. RSS 3,5-4,2 Go stable.
+
+**Stage 3 : résiduel non résolu** — `keep(texture)` n'était pas le crashur
+(crash ~2 s entrée du monde, même signature dump). HANDOFF-ASTRA.md écrit :
+suspects restants = sweep() dans execute_own, staleness `host.state` des
+barrières present, `Step::Host` non gaté, ou drop COM bypassant `retire`.
+
+**Prochains leviers** (audits B2/C1, non implémentés) : wait GPU hors du lock
+`submitted` (plan détaillé dans le rapport B2, risque B), fetch card_back
+send-tôt/wait-tard (~20-80 ms), merges u8→u64, `MESIA_RELAY=1` à re-tester
+maintenant que v2/v3 sont en place, `MESIA_LATE_WAIT_LISTS` réglage.
