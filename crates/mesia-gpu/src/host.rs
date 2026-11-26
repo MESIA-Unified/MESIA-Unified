@@ -1720,8 +1720,10 @@ enum Step {
     Refresh(std::sync::Arc<crate::shadow::Shadow>, usize, usize),
     /// Work that may write title memory.
     Run(Box<dyn Fn() + Send>),
-    /// Work that writes host memory only.
-    Host(Box<dyn Fn() + Send>),
+    /// Work that writes host memory only, reading the title range given
+    /// (empty for none): checked like a `Fill`'s source against memory
+    /// flights' shaders may write.
+    Host(std::ops::Range<usize>, Box<dyn Fn() + Send>),
     /// Shaders write a range (address, bytes) of a buffer's host copy.
     GpuWrite(std::sync::Arc<crate::shadow::Shadow>, usize, usize),
     /// Brings a texture's staging buffer up to date: once per submission,
@@ -2144,7 +2146,7 @@ const WHY_FENCE: usize = 10;
 /// bottom-of-pipe write; fence signals set behind flights.
 /// Then: the settles for title memory read, by what read it (a buffer
 /// copy, a fill of upload memory, a texture).
-static LATE_STATS: [std::sync::atomic::AtomicU64; 18] = [const { std::sync::atomic::AtomicU64::new(0) }; 18];
+static LATE_STATS: [std::sync::atomic::AtomicU64; 19] = [const { std::sync::atomic::AtomicU64::new(0) }; 19];
 
 /// Since the last frame-rate line: the microseconds settles waited for the
 /// card, by why they settled (the `WHY_` places).
@@ -2235,7 +2237,15 @@ fn blocked_by(written: &[(usize, usize)], runs: &[&HostList], count: bool) -> Op
                     }
                 }
                 Step::Run(_) => return Some(WHY_RUN),
-                Step::Refresh(..) | Step::GpuWrite(..) | Step::Host(_) => {}
+                Step::Host(read, _) => {
+                    if touches(written, read.start, read.end) {
+                        if count {
+                            LATE_STATS[18].fetch_add(1, Ordering::Relaxed);
+                        }
+                        return Some(WHY_READ);
+                    }
+                }
+                Step::Refresh(..) | Step::GpuWrite(..) => {}
             }
         }
     }
@@ -2657,7 +2667,7 @@ fn late_line(frames: f64) {
         "submissions sent ahead per frame: {:.1} in {:.1} settles ({:.1} flights each time), {:.1} ms waiting for the card in them; \
          settled for: a synchronous submission or present {:.1}, the card had run them {:.1}, a wait for a memory value {:.1}, \
          title memory changed under shader writes {:.1}, title memory read {:.1} (by a buffer copy {:.1}, a fill of upload memory {:.1}, \
-         a texture {:.1}), a step of ours {:.1}, {} lists in the air {:.1}, \
+         a texture {:.1}, host work {:.1}), a step of ours {:.1}, {} lists in the air {:.1}, \
          bottom-of-pipe writes (MESIA_LATE_WAIT_WRITES=0) {:.1}, a blocking fence wait {:.1}; \
          {:.1} waits for memory values met by a flight's bottom-of-pipe write, {:.1} fence signals set behind flights",
         s[0],
@@ -2672,6 +2682,7 @@ fn late_line(frames: f64) {
         s[15],
         s[16],
         s[17],
+        s[18],
         s[WHY_RUN],
         late_most(),
         s[WHY_MOST],
@@ -5562,7 +5573,7 @@ impl HostList {
             // The words after the budget hold what the clamp noted about the
             // list's last run (mesh dispatches: the largest group count
             // asked for, the groups asked in all): taken, then zeroed.
-            deferred.copies.push(Step::Host(Box::new(move || unsafe {
+            deferred.copies.push(Step::Host(0..0, Box::new(move || unsafe {
                 let words = at as *mut u32;
                 let (largest, all) = (words.add(1).read_volatile(), words.add(2).read_volatile());
                 MESH_GROUPS[0].fetch_max(u64::from(largest), Ordering::Relaxed);
@@ -5625,7 +5636,18 @@ impl HostList {
 
     /// As [`HostList::defer`], for work that writes only host memory.
     pub(crate) fn defer_host(&self, work: impl Fn() + Send + 'static) {
-        self.deferred().copies.push(Step::Host(Box::new(work)));
+        self.defer_host_read(0..0, work);
+    }
+
+    /// As [`HostList::defer_host`], reading the title memory `read` spans:
+    /// a submission while flights may write it waits for them first, or
+    /// the read tears.
+    pub(crate) fn defer_host_read(
+        &self,
+        read: std::ops::Range<usize>,
+        work: impl Fn() + Send + 'static,
+    ) {
+        self.deferred().copies.push(Step::Host(read, Box::new(work)));
     }
 
     /// Brings a texture's staging buffer up to date when the list is
@@ -5676,7 +5698,7 @@ impl HostList {
                     batch.add(shadow, *address, *len);
                     continue;
                 }
-                Step::Run(work) | Step::Host(work) => {
+                Step::Run(work) | Step::Host(_, work) => {
                     if matches!(step, Step::Run(_)) {
                         batch.title_written();
                     }
@@ -6014,6 +6036,14 @@ pub(crate) fn read_into(src: *const u8, dst: &mut [u8]) -> bool {
 /// Copies `len` bytes from `src` to `dst` unless a source page is not
 /// readable.
 fn read(src: *const u8, dst: *mut u8, len: usize) -> bool {
+    // The plain copy (`MESIA_COPY_PLAIN=1`) reads in place and reports a
+    // missing page instead of crossing to the kernel. On false (disabled,
+    // cooling or faulted) the kernel retries the whole range, covering
+    // any prefix the instruction wrote.
+    #[cfg(target_arch = "x86_64")]
+    if unsafe { crate::plaincopy::copy(src, dst, len) } {
+        return true;
+    }
     use windows_sys::Win32::System::Diagnostics::Debug::ReadProcessMemory;
     use windows_sys::Win32::System::Threading::GetCurrentProcess;
     let mut done = 0;
@@ -6828,7 +6858,7 @@ fn step_text(step: &Step) -> String {
             format!("refresh a buffer's host copy at {address:#x}+{len:#x}")
         }
         Step::Run(_) => "a submission-time step that may write title memory".to_owned(),
-        Step::Host(_) => "a submission-time step on host memory".to_owned(),
+        Step::Host(..) => "a submission-time step on host memory".to_owned(),
         Step::GpuWrite(_, address, len) => {
             format!("shaders may write a host copy at {address:#x}+{len:#x}")
         }

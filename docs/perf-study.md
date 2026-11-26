@@ -1,5 +1,20 @@
 # MESIA — Étude d'optimisation mesia-gpu
 
+## Mesures V5.5 — Kelvaroq phase 1 (27 novembre, binaire reverté)
+
+Contexte : binaire post-`aa9be38` + `plaincopy` (dormant) + `defer_host_read`
+(reverté au call-site après bisect). `LATE_WAIT=2`, même save, cache chaud.
+
+| Run | Config | Résultat |
+|---|---|---|
+| A | gating `Step::Host` + `MESIA_COPY_PLAIN=1` | **DEVICE_HUNG** ~4-5 min in-world (« 5 of 11 »), P50≈485 ms warm-up inclus, copies ~86-100 ms/~100 Mo |
+| B | gating seul (COPY_PLAIN absent) | **DEVICE_HUNG** ~35 s in-world (« 4 of 10 ») |
+| témoin | reverté, plaincopy dormant | in-world >10 min, **0 crash**, ~441-518 ms/frame steady, 4 160 draws/frame |
+
+Verdict : le gating naïf `Step::Host` est le crashur (auto-dépendance
+intra-liste probable) — reverté ; `COPY_PLAIN` disculpé du crash mais gain
+non démontré (A/B à refaire sur charge isométrique). Soak long en cours.
+
 ## Baseline graphique V5.2 du 26 novembre 2026
 
 Windows 11, RTX 3060 12 Go, pilote 617.14, release MSVC, un job de compilation terminé avant les tests. Chaque processus ouvre une fenêtre 128 × 64 et rend deux triangles magenta sur fond noir. Le buffer de sommets change à chaque image. La référence GFX10 construit ses propres signatures et métadonnées, puis fait passer **le VS et le PS** par `emit::translate` et le validateur DXIL du SDK. Le mode PC compile deux entrées HLSL originales avec DXC. Les deux modes utilisent le même PSO graphique par configuration, le même oracle CPU et la même boucle de présentation.

@@ -1,5 +1,15 @@
 # Session autonome — notes de travail (2026-11-25)
 
+## 27 novembre 2026 — V5.5, Kelvaroq phase 1 : plaincopy porté (dormant), gating Step::Host reverté après 2 crashs
+
+**Base `aa9be38`.** Intégration phase 1 du roadmap Kelvaroq. Provenance vérifiée : `plaincopy` (patch 0044) et les drop-ins render sont GPL-3.0-or-later pur, aucun flag XCL — importables avec attribution.
+
+- **`plaincopy`** porté dans `crates/mesia-gpu/src/plaincopy.rs` (~450 LOC) : `rep movsb` in-process + VEH (fautes de **lecture** sur sa propre instruction uniquement ; écritures et `GUARD_PAGE` passent aux handlers suivants — watch conserve ses gardes), bloc 64 Kio fautif → liste noire 2 s → repli `ReadProcessMemory`, <256 o → noyau. Gate `MESIA_COPY_PLAIN=1`, **défaut OFF**. 4 tests unitaires verts.
+- **`Step::Host` gating = crashur confirmé par bisect.** Le WIP `defer_host_read` (fix suspect #1 de l'audit A3) a été implémenté (`Step::Host(Range)`, gate vs `line().written`, `LATE_STATS`→19). Résultat : **2 DEVICE_HUNG** (35 s et ~5 min in-world sous LATE_WAIT=2, « 4 of 10 » / « 5 of 11 ») — vs >11 h stables sans. **Crash B sans `COPY_PLAIN`** ⇒ plaincopy disculpé, le gating seul changeait le comportement. Hypothèse : attente intra-liste (plage lue recouvre nos write-back en vol → auto-dépendance). **Revert du call-site** (`draw.rs` → `defer_host`) ; plomberie dormante conservée. Voir HANDOFF-ASTRA.md suspect #3.
+- **Mesures** : run B (`COPY_PLAIN=1`, avant crash) P50=485 ms incluant warm-up, copies ~86-100 ms/~100 Mo — non comparable directement à la baseline (scène non isométrique). Run témoin reverté : in-world stable >10 min, ~441-518 ms/frame, 0 crash, soak long en cours.
+- **Décisions** : plaincopy conservé dormant (A/B propre à refaire) ; drop-ins render non intégrés (doublons de `dirty`/`rows` existants) ; sites XCL GPL-2.0-only exclus. Rapport complet : docs/KELVAROQ-PHASE1-RESULTS.md.
+- **Suite** : A/B COPY_PLAIN sur binaire stabilisé ; re-gating Step::Host correct (vols externes seuls) avec Astra ; P2 roadmap = async present borné + wait GPU hors lock `submitted`.
+
 ## 27 novembre 2026 — V5.2, fix flights v2 validé (commit 80e6410)
 
 **Le crash DEVICE_HUNG sous flights est corrigé.** Le bug résiduel après `016dddb` était l'anneau `pass.views` (`host.rs:929-1175`) : 256 slots SRV shader-visibles **globaux**, écrits à l'enregistrement dans `record_plane_pass`, commentaire assumant « the ring is far from coming round » — vrai seulement en synchrone. Sous `LATE_WAIT≥1` avec ~130 listes en vol, l'anneau boucle dans la fenêtre en vol et réécrit un slot qu'une liste encore en exécution lit → descripteur déchiré → VA sauvage → TDR (audit agent edd7f379).

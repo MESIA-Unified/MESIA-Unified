@@ -1,5 +1,17 @@
 # Campagne V5.2 — atteindre 4 images traduites distinctes par seconde
 
+## V5.5 — Kelvaroq phase 1 (27 novembre, suite)
+
+Baseline `aa9be38`. `plaincopy` porté derrière `MESIA_COPY_PLAIN` (défaut OFF,
+4 tests verts, provenance GPL-3.0 vérifiée). Le gating `Step::Host`/`defer_host_read`
+implémenté pour l'audit A3 a produit **2 DEVICE_HUNG** (35 s et ~5 min sous
+LATE_WAIT=2) — bisect : `COPY_PLAIN` disculpé, le gating seul en cause
+(auto-dépendance intra-liste probable) → **revert du call-site**, plomberie
+dormante. Run témoin reverté : stable >10 min in-world, ~441-518 ms. Détails :
+[KELVAROQ-PHASE1-RESULTS.md](docs/KELVAROQ-PHASE1-RESULTS.md). Suite : A/B
+COPY_PLAIN propre sur le binaire stabilisé ; re-gating correct (vols externes
+seulement) avec Astra ; phase 2 du roadmap (async present borné).
+
 ## Reprise active — Devin
 
 Le [handoff du 26 novembre](HANDOFF-DEVIN.md) donne l’inventaire des fichiers, la restauration par SHA-256 et les preuves déjà acquises. Le prochain livrable est une baseline sur replay représentatif autorisé avec copies de retour et oracle graphique. Mesurer ensuite séparément le coût de `declared_writes`, des transferts et des caches sur cette charge. Les travaux Sol, Luna et Astra ci-dessous constituent l’historique de référence.

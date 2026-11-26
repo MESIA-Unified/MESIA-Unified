@@ -31,6 +31,10 @@ n'est intégré sans A/B sur charge réelle — KELVAROQ-BENCHMARK-PLAN.md).
 `texel_rows`, `upload_pool`, `residency` — ~700 LOC Rust pur avec leurs tests portés)
 + `plaincopy` 0044 derrière `MESIA_*` env-gate, fallback `ReadProcessMemory` au premier
 doute. Livrable : benchmark copies ms sur fixture merge, puis A/B 3×300 s.
+**Statut V5.5** : `plaincopy` porté et gate `MESIA_COPY_PLAIN` (défaut OFF, 4 tests
+verts) ; drop-ins différés (doublons `dirty`/`rows` existants). A/B encore à refaire —
+voir KELVAROQ-PHASE1-RESULTS.md (le seul run activé a été interrompu par le crash
+gating, non imputable à plaincopy).
 
 **Phase 2 — async present borné + descripteurs incrémentaux** (M, risque B) :
 `FrameLimit`/`Held::Present` 0046/0048 — **à traiter en lien avec HANDOFF-ASTRA** :

@@ -49,6 +49,16 @@ submit (host.rs:4337-4342, cadence 1500 ms).
    `expand_rects` lit la mémoire titre — pas de settle → lecture déchirée
    possible vs `line.written`. Plutôt corruption que hang, mais c'est la seule
    classe d'écrivain non gatée.
+   **ESSAI V5.5 — le gating naïf crashe** : `Step::Host(Range)` + gate vs
+   `line().written` a produit **2 DEVICE_HUNG** (35 s et ~5 min in-world,
+   LATE_WAIT=2, signatures « 4 of 10 » / « 5 of 11 »). Reverté au call-site
+   (`defer_host` → `0..0` dormant) ; run témoin stabilisé. Hypothèse : la
+   plage lue recouvre des write-back/echo de nos propres lignes en vol →
+   attente intra-liste (la ligne bloquante est dans la même soumission, pas
+   encore exécutée) → auto-dépendance → liste bloquée → hang. Toute
+   réactivation doit gater **uniquement sur les écrits d'autres soumissions
+   en vol**, jamais les lignes intra-liste — et vérifier que la plage
+   déclarée exclut nos propres write-back.
 4. **Drop COM bypassant `retire`** : chemins `object::release_boxed` non
    audités — une ressource libérée qu'un vol enregistre encore = la classe de
    bug exacte.
