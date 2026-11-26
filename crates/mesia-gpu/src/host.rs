@@ -2309,8 +2309,8 @@ enum Late {
     Run(Flight),
     /// A bottom-of-pipe write of the flight before it: address, what, bytes.
     Write(usize, crate::queue::Written, usize),
-    /// A fence (its address) signalled behind the flights before it.
-    Signal(usize, u64),
+    /// An owned fence, signalled after the preceding flights land.
+    Signal(crate::fence::FenceRef, u64),
 }
 
 struct Line {
@@ -2517,7 +2517,9 @@ fn stale_under_flights(runs: &[&HostList]) -> bool {
 /// A fence signal on a queue ([`late`]): goes behind the flights in the
 /// air, if there are any, and is set when they are settled. Whether it
 /// did; if not the caller sets the fence now.
-pub(crate) fn late_signal(fence: usize, value: u64) -> bool {
+/// # Safety
+/// The caller must hold a live MESIA fence throughout this call.
+pub(crate) unsafe fn late_signal(fence: crate::object::This, value: u64) -> bool {
     if !late() {
         return false;
     }
@@ -2525,7 +2527,8 @@ pub(crate) fn late_signal(fence: usize, value: u64) -> bool {
     if line.line.is_empty() && !line.settling {
         return false;
     }
-    line.line.push(Late::Signal(fence, value));
+    // SAFETY: the caller holds the fence while we take the flight's reference.
+    line.line.push(Late::Signal(unsafe { crate::fence::FenceRef::retain(fence) }, value));
     LATE_STATS[14].fetch_add(1, Ordering::Relaxed);
     drop(line);
     // A signal alone (behind a settle under way) has no flight to wake
@@ -4046,7 +4049,7 @@ impl Host {
                     landed.push((flight.lists, flight.order));
                 }
                 Late::Write(at, what, bytes) => what.write(at as *mut u8, bytes),
-                Late::Signal(fence, value) => crate::fence::set(fence as crate::object::This, value),
+                Late::Signal(fence, value) => crate::fence::set(fence.as_raw(), value),
             }
         }
         if last > 0 {
@@ -4515,7 +4518,7 @@ impl Host {
                         landed.push((flight.lists, flight.order));
                     }
                     Late::Write(at, what, bytes) => what.write(at as *mut u8, bytes),
-                    Late::Signal(fence, value) => crate::fence::set(fence as crate::object::This, value),
+                    Late::Signal(fence, value) => crate::fence::set(fence.as_raw(), value),
                 }
             }
             if last > 0 {
@@ -4543,12 +4546,14 @@ impl Host {
     /// still held.
     fn submit<'a>(&'a self, runs: &[&HostList], late: bool) -> Option<(std::sync::MutexGuard<'a, u64>, Sent)> {
         #[cfg(feature = "diagnostics")]
-        let called = std::time::Instant::now();
-        #[cfg(feature = "diagnostics")]
         crate::copystat::submission_begins();
         // One submission at a time from preparation to copy-back: snapshots
         // and the ranges shaders write are per host copy, not per submission.
+        #[cfg(feature = "diagnostics")]
+        let acquiring = std::time::Instant::now();
         let mut submitted = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
+        #[cfg(feature = "diagnostics")]
+        let lock = acquiring.elapsed().as_micros() as u64;
         let was_working = working(true);
         submitting(1, runs.len());
         // Flights in the air ([`late`]): a submission that is waited for
@@ -4589,8 +4594,6 @@ impl Host {
         // The ranges shaders write are counted for it (with the relay).
         crate::shadow::preparing(this_submission);
         let started = std::time::Instant::now();
-        #[cfg(feature = "diagnostics")]
-        let lock = (started - called).as_micros() as u64;
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::Submissions, 1);
         let mut lists: Vec<Option<ID3D12CommandList>> = Vec::with_capacity(2 * runs.len());

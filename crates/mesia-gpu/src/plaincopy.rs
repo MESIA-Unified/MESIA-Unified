@@ -404,7 +404,7 @@ mod x64 {
             let rpm = |src: *const u8, dst: *mut u8, len: usize| {
                 let mut bytes = 0;
                 // SAFETY: both buffers are this process's own, `len` long.
-                unsafe {
+                let ok = unsafe {
                     ReadProcessMemory(
                         GetCurrentProcess(),
                         src.cast(),
@@ -412,45 +412,58 @@ mod x64 {
                         len,
                         &mut bytes,
                     )
-                }
+                };
+                ok != 0 && bytes == len
             };
-            println!("{:>10} {:>12} {:>12} {:>12} {:>10}", "len", "plain ns", "kernel ns", "GB/s x", "checked");
+            println!("bytes | plain ns/copy | kernel ns/copy | plain GB/s | kernel GB/s | speedup | copies/path");
             for &len in &[256usize, 4096, 16384, 65536, 262144, 1048576, 4194304] {
                 let iters = (256 << 20) / len;
                 let mut src = vec![0u8; len + 64];
                 for (i, b) in src.iter_mut().enumerate() {
                     *b = (i as u32).wrapping_mul(2654435761) as u8;
                 }
-                let mut dst = vec![0u8; len + 64];
-                // The worst case for the instruction: an unaligned source.
-                let (src_at, dst_at) = unsafe { (src.as_ptr().add(37), dst.as_mut_ptr().add(11)) };
-                let t = Instant::now();
-                let mut plain = 0usize;
-                for _ in 0..iters {
-                    // SAFETY: separate buffers, each `len` bytes from the offsets.
-                    if unsafe { attempt(src_at, dst_at, len, &faults) } == Path::Plain {
-                        plain += 1;
+                let expected = &src[37..37 + len];
+                let mut dst = vec![0xa5; len + 64];
+                let mut measure = |kernel: bool| {
+                    // Start each path with the opposite of every expected byte.
+                    // Validate it before the other path can overwrite the result.
+                    let output = &mut dst[11..11 + len];
+                    for (out, &byte) in output.iter_mut().zip(expected) {
+                        *out = !byte;
                     }
-                }
-                let plain_ns = t.elapsed().as_nanos() as f64 / iters as f64;
-                let t = Instant::now();
-                for _ in 0..iters {
-                    assert_ne!(rpm(src_at, dst_at, len), 0);
-                }
-                let kernel_ns = t.elapsed().as_nanos() as f64 / iters as f64;
-                assert_eq!(plain, iters, "every read of committed memory must take the fast path");
-                // SAFETY: same extent both paths wrote last.
-                let (a, b) = unsafe {
-                    (
-                        std::slice::from_raw_parts(src_at, len),
-                        std::slice::from_raw_parts(dst_at, len),
-                    )
+                    let src_at = expected.as_ptr();
+                    let dst_at = output.as_mut_ptr();
+                    let started = Instant::now();
+                    let mut complete = 0;
+                    if kernel {
+                        for _ in 0..iters {
+                            complete += usize::from(rpm(src_at, dst_at, len));
+                        }
+                    } else {
+                        for _ in 0..iters {
+                            // SAFETY: both slices belong to this process, cover
+                            // `len` bytes, and their allocations are disjoint.
+                            let path = unsafe { attempt(src_at, dst_at, len, &faults) };
+                            complete += usize::from(path == Path::Plain);
+                        }
+                    }
+                    let ns = started.elapsed().as_nanos() as f64 / iters as f64;
+                    let method = if kernel { "kernel" } else { "plain" };
+                    assert_eq!(complete, iters, "{method}: incomplete copies at {len} bytes");
+                    assert!(output == expected, "{method}: incorrect payload at {len} bytes");
+                    assert!(
+                        dst[..11].iter().chain(&dst[11 + len..]).all(|&b| b == 0xa5),
+                        "{method}: destination padding changed at {len} bytes"
+                    );
+                    ns
                 };
-                assert_eq!(a, b, "the kernel's last copy must equal the source");
+                let plain_ns = measure(false);
+                let kernel_ns = measure(true);
                 println!(
-                    "{len:>10} {plain_ns:>12.0} {kernel_ns:>12.0} {:>12.2} {:>10}",
+                    "{len} | {plain_ns:.1} | {kernel_ns:.1} | {:.2} | {:.2} | {:.2} | {iters}",
+                    len as f64 / plain_ns,
+                    len as f64 / kernel_ns,
                     kernel_ns / plain_ns,
-                    iters
                 );
             }
         }

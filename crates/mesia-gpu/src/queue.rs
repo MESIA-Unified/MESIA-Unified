@@ -44,15 +44,15 @@ const _: () = assert!(std::mem::offset_of!(Queue, kind) == 0x10);
 /// One thing a waiting queue holds back.
 #[cfg(windows)]
 enum Held {
-    /// The queue waits for the fence (its address) to reach the value.
-    Wait(usize, u64),
+    /// The queue holds the fence until the wait is consumed or cancelled.
+    Wait(crate::fence::FenceRef, u64),
     /// A list of the next submission waits for a memory value.
     Value(crate::list::ValueWait),
     /// A submission: the lists' host sides, taken from the title's lists
     /// (which it may reset meanwhile), and the order they run in.
     Run(Vec<crate::list::Detached>, Vec<usize>),
     /// A signal of the queue's, due after what it holds before it.
-    Signal(usize, u64),
+    Signal(crate::fence::FenceRef, u64),
 }
 
 /// The queues that hold something (their addresses).
@@ -323,8 +323,8 @@ pub(crate) fn release_held(all: bool) {
             loop {
                 match held.first() {
                     None => break,
-                    Some(&Held::Wait(fence, value))
-                        if !all && crate::fence::completed(fence as This) < value =>
+                    Some(Held::Wait(fence, value))
+                        if !all && crate::fence::completed(fence.as_raw()) < *value =>
                     {
                         break;
                     }
@@ -406,8 +406,9 @@ pub(crate) fn release_held(all: bool) {
                     // Behind what was sent to the card and not waited
                     // for, if anything was.
                     Held::Signal(fence, value) => {
-                        if !crate::host::late_signal(fence, value) {
-                            crate::fence::set(fence as This, value);
+                        // SAFETY: the held operation owns the fence through this call.
+                        if !unsafe { crate::host::late_signal(fence.as_raw(), value) } {
+                            crate::fence::set(fence.as_raw(), value);
                         }
                     }
                 }
@@ -616,13 +617,17 @@ extern "system" fn signal(this: This, fence: This, value: u64) -> HRESULT {
     }
     // A queue that waits signals after what it holds.
     #[cfg(windows)]
-    if hold(this, || Held::Signal(fence as usize, value)) {
+    if hold(this, || {
+        // SAFETY: the caller owns the fence for the duration of Signal.
+        Held::Signal(unsafe { crate::fence::FenceRef::retain(fence) }, value)
+    }) {
         return S_OK;
     }
     // Behind the submissions sent to the card and not waited for: the
     // fence is set when they are settled.
     #[cfg(windows)]
-    if crate::host::late_signal(fence as usize, value) {
+    // SAFETY: the caller owns the fence for the duration of Signal.
+    if unsafe { crate::host::late_signal(fence, value) } {
         return S_OK;
     }
     let _ = this;
@@ -655,7 +660,8 @@ extern "system" fn wait(this: This, fence: This, value: u64) -> HRESULT {
             let mut held = lock(&queue(this).held);
             let behind = !held.is_empty() || now < value;
             if behind && waits() {
-                held.push(Held::Wait(fence as usize, value));
+                // SAFETY: the caller owns the fence for the duration of Wait.
+                held.push(Held::Wait(unsafe { crate::fence::FenceRef::retain(fence) }, value));
             }
             behind
         };
@@ -1050,6 +1056,32 @@ mod tests {
             0x80
         } else {
             0x70
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn deferred_queue_operations_retain_both_fences_until_the_wait_passes() {
+        let null = std::ptr::null();
+        let desc = QueueDesc { kind: 0, priority: 0, flags: 0, nodes: 0 };
+        let (mut q, mut gate, mut target) = (null, null, null);
+        assert_eq!(create(null, &desc, &QUEUE_IIDS[0], &mut q), S_OK);
+        for out in [&mut gate, &mut target] {
+            assert_eq!(crate::fence::create(null, 0, 0, &crate::fence::FENCE_IIDS[0], out), S_OK);
+        }
+        assert_eq!(wait(q, gate, 1), S_OK);
+        assert_eq!(signal(q, target, 7), S_OK);
+        assert_eq!(crate::fence::completed(target), 0);
+        // Keep the original references throughout. Also safe on the old
+        // implementation, where the probe observes two instead of three.
+        for fence in [gate, target] {
+            assert_eq!(object::add_ref(fence), 3);
+            assert_eq!(slot::<extern "system" fn(This) -> u32>(fence, 0x10)(fence), 2);
+        }
+        assert_eq!(crate::fence::signal(gate, 1), S_OK);
+        assert_eq!(crate::fence::completed(target), 7);
+        for object in [q, gate, target] {
+            assert_eq!(slot::<extern "system" fn(This) -> u32>(object, 0x10)(object), 0);
         }
     }
 

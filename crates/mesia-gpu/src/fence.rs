@@ -37,6 +37,36 @@ fn fence<'a>(this: This) -> &'a Fence {
     unsafe { &*this.cast::<Fence>() }
 }
 
+/// A queue operation owns the fence from enqueue until completion or cancellation.
+#[cfg(any(windows, test))]
+pub(crate) struct FenceRef(This);
+
+// SAFETY: the reference keeps the allocation alive on the receiving thread.
+// The fence value and reference count are atomic, and a mutex protects the waiters.
+#[cfg(any(windows, test))]
+unsafe impl Send for FenceRef {}
+
+#[cfg(any(windows, test))]
+impl FenceRef {
+    /// # Safety
+    /// `this` must name a live MESIA fence held by the caller during this call.
+    pub(crate) unsafe fn retain(this: This) -> Self {
+        object::add_ref(this);
+        Self(this)
+    }
+
+    pub(crate) fn as_raw(&self) -> This {
+        self.0
+    }
+}
+
+#[cfg(any(windows, test))]
+impl Drop for FenceRef {
+    fn drop(&mut self) {
+        release(self.0);
+    }
+}
+
 pub(crate) extern "system" fn create(
     _: This,
     initial: u64,
@@ -156,7 +186,40 @@ static FUNCTIONS: Table<24> = {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(windows)]
     use crate::object::slot;
+
+    #[test]
+    fn deferred_fence_survives_caller_release_and_balances_refs() {
+        let mut raw = std::ptr::null();
+        assert_eq!(create(std::ptr::null(), 3, 0, &FENCE_IIDS[0], &mut raw), S_OK);
+        // The observer keeps the object live even if the retention assertion fails.
+        assert_eq!(object::add_ref(raw), 2);
+        // SAFETY: the caller owns the newly created fence.
+        let pending = unsafe { FenceRef::retain(raw) };
+        assert_eq!(release(raw), 2, "caller releases its reference after enqueue");
+        std::thread::spawn(move || {
+            assert_eq!(completed(pending.as_raw()), 3);
+            set(pending.as_raw(), 11);
+        })
+        .join()
+        .unwrap();
+        assert_eq!(completed(raw), 11);
+        assert_eq!(release(raw), 0, "only the observer remains after completion");
+    }
+
+    #[test]
+    fn cancelling_a_deferred_signal_releases_its_reference_without_signalling() {
+        let mut raw = std::ptr::null();
+        assert_eq!(create(std::ptr::null(), 7, 0, &FENCE_IIDS[0], &mut raw), S_OK);
+        // SAFETY: the caller retains its original reference until the last assertion.
+        let cancelled = unsafe { FenceRef::retain(raw) };
+        assert_eq!(object::add_ref(raw), 3);
+        assert_eq!(release(raw), 2);
+        drop(cancelled);
+        assert_eq!(completed(raw), 7);
+        assert_eq!(release(raw), 0);
+    }
 
     #[cfg(windows)]
     #[test]
