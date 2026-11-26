@@ -1,5 +1,15 @@
 # Session autonome — notes de travail (2026-11-25)
 
+## 27 novembre 2026 — V5.2, fix flights v2 validé (commit 80e6410)
+
+**Le crash DEVICE_HUNG sous flights est corrigé.** Le bug résiduel après `016dddb` était l'anneau `pass.views` (`host.rs:929-1175`) : 256 slots SRV shader-visibles **globaux**, écrits à l'enregistrement dans `record_plane_pass`, commentaire assumant « the ring is far from coming round » — vrai seulement en synchrone. Sous `LATE_WAIT≥1` avec ~130 listes en vol, l'anneau boucle dans la fenêtre en vol et réécrit un slot qu'une liste encore en exécution lit → descripteur déchiré → VA sauvage → TDR (audit agent edd7f379).
+
+**Fix** : le pass loue `slices × mips` slots `dynamic` consécutifs du heap de vues principal (`descriptor::view_heap` + `HostHeap::dynamic`), consignés sur `HostList.plane_slots` et libérés à `reset()`/`Drop` — même durée de vie que les slots de tables (`tables_done`/recycle). `HostHeap::srv_at` écrit la vue et garde la ressource. Fallback sans heap de vues : l'ancien anneau, seulement sous `settle_and_hold` en vol, sinon le pass est sauté (jamais le crash).
+
+**Mesuré** : `LATE_WAIT=2` in-world **>4 min, 132 listes en vol, zéro crash** (crash à ~23 s avant) — **~410-450 ms/frame vs ~470-520 ms synchrone**. Les compteurs confirment le vol réel (132.3 in the air). `LATE_WAIT=3` en test à la suite. 128/128 tests mesia-gpu.
+
+**Reste ouvert** : le check→write gap du candidat #2 de l'audit (`mirror_shown`/`flush_deferred`, `descriptor/host.rs:1480→1513`) — fenêtre ~ns-ms où une soumission peut démarrer entre le test `in_the_air()` et l'écriture. Probablement le crash résiduel si `LATE_WAIT=3` retombe ; le fix serait de prendre `host.submitted` (try_lock→defer, acquis→write sous lock). Aussi : crash interne du titre ~2 min après le monde (breakpad uploade vers backtrace.io, bloqué par le net HLE — à suivre) et le skinning partiel du personnage (écrits compute→vertex buffers non rapatriés, « bytes from before 0 MB »).
+
 ## 26 novembre 2026 — passation à Devin
 
 Le point de reprise est figé dans [HANDOFF-DEVIN.md](HANDOFF-DEVIN.md). Le miroir Git local est propre à `293b8a4`. La campagne vit dans `mesia-main` et sa sauvegarde de sources. La comparaison des arbres a identifié une différence de casse dans le chemin du document d’architecture. Les preuves de référence restent les six passages graphiques release, le test du compteur et les validations VALU/compute déjà consignées. Le premier travail de Devin est de qualifier le replay avant de choisir une optimisation. Cette intervention est une passation documentaire et une sauvegarde, sans nouvelle compilation ni exécution GPU.

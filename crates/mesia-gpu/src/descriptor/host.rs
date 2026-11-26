@@ -1561,6 +1561,12 @@ impl HostHeap {
             // Not a view of ours (never written, or of a resource the
             // title released): nothing to read.
             if made[index as usize].key != 0 {
+                // A submission that started since the entry check would
+                // read the slot mid-write: the write waits in `deferred`.
+                if in_the_air() {
+                    self.defer(index, Deferred::Mirror(handle, for_draw));
+                    return None;
+                }
                 made[index as usize] = Made::default();
                 self.make_null(index);
                 let _ = self.note_buffer(index, None, false);
@@ -1622,6 +1628,20 @@ impl HostHeap {
             .is_some_and(|old| same_placed_texture(&old, &view))
         {
             KEPT_VIEWS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            return Some(std::sync::Arc::new(Shown {
+                key,
+                view,
+                copy: None,
+                epoch: super::views_epoch(),
+            }));
+        }
+        // A submission that started since the entry check would read
+        // the slot mid-write (the path since, `note_buffer` and
+        // `wait_for`, can take as long as a texture's making): the write
+        // waits in `deferred` and the record's resolved view is what the
+        // caller gets, as when the check itself deferred.
+        if !later && in_the_air() {
+            self.defer(index, Deferred::Mirror(handle, for_draw));
             return Some(std::sync::Arc::new(Shown {
                 key,
                 view,
