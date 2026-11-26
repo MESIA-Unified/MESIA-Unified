@@ -779,7 +779,14 @@ extern "system" fn present(
     if crate::host::late() && !crate::host::late_free_present() {
         crate::host::settle_for_present();
         release_held(false);
-        crate::host::settle_for_present();
+        // With `forces()` the present's own submission settles all of it:
+        // a second drain here waits on the flights just sent, then the
+        // present's settle waits on them again. Keep it only when waits
+        // are kept across frames (`MESIA_WAIT_FORCE=0`), where landing
+        // the flights may free held lists the present must not force.
+        if !forces() {
+            crate::host::settle_for_present();
+        }
     } else if crate::host::late() {
         // The present is sent ahead too: what waits for a value a flight
         // will write runs behind that flight, and nothing is settled here.

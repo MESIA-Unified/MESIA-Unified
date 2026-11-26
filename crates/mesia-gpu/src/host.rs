@@ -4367,13 +4367,27 @@ impl Host {
             let mut spans: std::collections::HashMap<usize, (usize, usize)> = std::collections::HashMap::new();
             for list in runs {
                 for step in &list.deferred().copies {
-                    if let Step::Refresh(shadow, address, len) = step
-                        && !shadow.unwatched()
-                    {
-                        let span = spans
-                            .entry(std::sync::Arc::as_ptr(shadow) as usize)
-                            .or_insert((*address, *address + *len));
-                        *span = (span.0.min(*address), span.1.max(*address + *len));
+                    match step {
+                        Step::Refresh(shadow, address, len) if !shadow.unwatched() => {
+                            let span = spans
+                                .entry(std::sync::Arc::as_ptr(shadow) as usize)
+                                .or_insert((*address, *address + *len));
+                            *span = (span.0.min(*address), span.1.max(*address + *len));
+                        }
+                        // Staging checks otherwise ask the write watch one
+                        // texture at a time (~30-70 us a syscall, several a
+                        // submission): covered here they read the same asking
+                        // as the refreshes. Unwatched memory keeps its old
+                        // path: it simply is not in the asking.
+                        Step::Texture(staging) => {
+                            let (start, size) = staging.memory();
+                            let end = start + size;
+                            let span = spans
+                                .entry(std::sync::Arc::as_ptr(staging) as usize)
+                                .or_insert((start, end));
+                            *span = (span.0.min(start), span.1.max(end));
+                        }
+                        _ => {}
                     }
                 }
             }
@@ -6547,6 +6561,11 @@ impl Host {
                 ),
             ]);
             copy.close();
+            // A present sent ahead runs after this returns: keep the
+            // source texture alive until the list's flight has landed
+            // (an `ahead` slot is reset only once `flown` has finished;
+            // `p.copy` waits for its own submission before reuse).
+            copy.keep(texture);
             match slot {
                 Some(i) => {
                     let flown = self.execute_own(copy);
