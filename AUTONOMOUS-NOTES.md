@@ -164,3 +164,32 @@ Plan : baseline reproductible (Phase 1) → CPU (watch incrémental, relay_wait,
 - Input autonome résolu : `scripts/enter.ps1` (clic réel sur la fenêtre → focus → keybd_event Enter). Le sélecteur de profil se passe seul maintenant.
 - Suspects suivants pour le même symptôme : (a) un second writer non-atomique sur état partagé (auditer tout `Create*View`/`copy_descriptors`/volatile >4B vers heap GPU-visible hors `defer`/`ready`), (b) la fenêtre résiduelle post-settle (soumission entre release du guard et enregistrement), (c) `strides`/staging races jugées « data-level » mais à revérifier côté DEVICE_HUNG réel, (d) épuisement/lifetime ressource à ~130 listes en vol (allocateurs, `late_most` listes=128 — coïncidence avec « 131 lists » ?).
 - Config stable livrée inchangée : `LATE_WAIT=0` + `-Fast` (+`INPLACE=2` possible puisque sync) → ~500 ms in-world, 0 crash.
+
+## V5.2 session 2 — flights fixes v2+v3 (Devin)
+
+**Livré** : `80e6410` (plane-ring -> per-list dynamic leases), `29bfe44`
+(mirror_shown re-check + re-defer at terminal writes; LATE_WAIT=2 shipped).
+
+**Fix v2** : `record_plane_pass` écrivait l'anneau global `PLANE_VIEWS` (256
+slots shader-visibles) à l'enregistrement, sans gate — l'anneau bouclait sous
+~131 listes en vol et écrasait des slots lus par des flights. Désormais chaque
+pass loue `host.dynamic(n)` slots + `in_the_air()->settle_and_hold()` fallback,
+libérés dans `HostList::reset()`/`Drop` — durée de vie = atterrissage exact.
+
+**Fix v3** : `mirror_shown_locked` vérifiait `in_the_air()` à l'entrée puis
+écrivait le slot après un chemin ms (`wait_for`->`host_copy`). Re-check +
+re-defer (`Deferred::Null`/`Deferred::Mirror`) aux deux sites d'écriture
+terminaux. Lock soumission tenu = rejeté (host_copy -> host.execute = deadlock).
+
+**Résultats** :
+- LATE_WAIT=2 : **>4 min in-world, 0 crash, 132-139 listes en vol**, ~410-545 ms
+  (~2-2.4 fps) — premier palier async stable jamais atteint.
+- LATE_WAIT=3 : toujours device-removed ~15-18 s in-world (3 repros). Signature
+  dump : listes en vol = compute+mesh+refreshes+copies upload (~70-131).
+  Suspects restants : réutilisation mémoire upload, cycle de vie des listes
+  present-flight (`p.ahead`), ou un 3e writer non identifié. Dumps dans
+  %TEMP%\crash_v5_1.txt.
+
+**Prochain** : audit du cycle upload-memory / `execute_own` / `Step::Host`
+sous flights stage 3, ou handoff GPT-6.2 Astra. Paliers : ~2 fps stable ✓
+(flats de ~410 ms observés = proche du palier 2,5 fps sur scènes légères).
