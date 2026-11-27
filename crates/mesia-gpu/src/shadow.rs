@@ -566,12 +566,41 @@ impl Flights {
 /// later flight at this moment, and a store there, even of the value just
 /// read, could undo that write. (The merge of a waited-for submission
 /// stores every byte of a differing stretch back into the copy.)
+/// Byte-lane merge of one u64: lanes where `n` differs from `s` take `n`,
+/// others keep `t`. Returns the per-byte write mask (`0xff` per lane `n`
+/// changed) and the merged word. The shift chain folds every bit of a lane
+/// into its bit 0 (no lane crosses) and `*0xff` spreads it.
+#[inline]
+fn merge_word(n: u64, s: u64, t: u64) -> (u64, u64) {
+    let d = n ^ s;
+    let m = d | (d >> 1) | (d >> 2) | (d >> 3) | (d >> 4) | (d >> 5) | (d >> 6) | (d >> 7);
+    let wrote = (m & 0x0101_0101_0101_0101).wrapping_mul(0xff);
+    (wrote, (t & !wrote) | (n & wrote))
+}
+
 fn merge_piece(now: &[u8], held: &mut [u8], title: &mut [u8]) -> bool {
-    let mut differs = 0u8;
-    for ((n, h), t) in now.iter().zip(held.iter_mut()).zip(title.iter_mut()) {
+    debug_assert_eq!(now.len(), held.len());
+    debug_assert_eq!(now.len(), title.len());
+    let mut differs = 0u64;
+    let (nw, nt) = (now.as_chunks::<8>().0, title.as_chunks_mut::<8>().0);
+    // The three slices can disagree on their shared tail; merge it bytewise.
+    let whole = nw.len().min(nt.len()).min(held.as_chunks::<8>().0.len()) * 8;
+    let mut i = 0;
+    while i < whole {
+        let n = u64::from_le_bytes(now[i..i + 8].try_into().unwrap());
+        let h = u64::from_le_bytes(held[i..i + 8].try_into().unwrap());
+        let t = u64::from_le_bytes(title[i..i + 8].try_into().unwrap());
+        let (wrote, merged) = merge_word(n, h, t);
+        differs |= merged ^ t;
+        title[i..i + 8].copy_from_slice(&merged.to_le_bytes());
+        let kept = (h & !wrote) | (n & wrote);
+        held[i..i + 8].copy_from_slice(&kept.to_le_bytes());
+        i += 8;
+    }
+    for ((n, h), t) in now[i..].iter().zip(held[i..].iter_mut()).zip(title[i..].iter_mut()) {
         let wrote = if *n != *h { 0xffu8 } else { 0 };
         let merged = (*t & !wrote) | (*n & wrote);
-        differs |= merged ^ *t;
+        differs |= u64::from(merged ^ *t);
         *t = merged;
         *h = (*h & !wrote) | (*n & wrote);
     }
@@ -2664,11 +2693,24 @@ impl Shadow {
                 // the GPU's byte where the copy's byte is not what it was
                 // before the submission, else the title's. (With the two
                 // searches above this was 44 ms a frame for 970 pieces.)
-                let mut differs = 0u8;
-                for ((t, h), o) in title.iter_mut().zip(host.iter_mut()).zip(old) {
+                let mut differs = 0u64;
+                let (hw, tw) = (host.as_chunks::<8>().0, title.as_chunks::<8>().0);
+                let whole = hw.len().min(tw.len()).min(old.as_chunks::<8>().0.len()) * 8;
+                let mut i = 0;
+                while i < whole {
+                    let h = u64::from_le_bytes(host[i..i + 8].try_into().unwrap());
+                    let o = u64::from_le_bytes(old[i..i + 8].try_into().unwrap());
+                    let t = u64::from_le_bytes(title[i..i + 8].try_into().unwrap());
+                    let (_, merged) = merge_word(h, o, t);
+                    differs |= merged ^ t;
+                    title[i..i + 8].copy_from_slice(&merged.to_le_bytes());
+                    host[i..i + 8].copy_from_slice(&merged.to_le_bytes());
+                    i += 8;
+                }
+                for ((t, h), o) in title[i..].iter_mut().zip(host[i..].iter_mut()).zip(old[i..].iter()) {
                     let gpu = if *h != *o { 0xffu8 } else { 0 };
                     let merged = (*t & !gpu) | (*h & gpu);
-                    differs |= merged ^ *t;
+                    differs |= u64::from(merged ^ *t);
                     *t = merged;
                     *h = merged;
                 }
@@ -3306,11 +3348,24 @@ impl Shadow {
         if crate::host::read_into((start + at) as *const u8, title) {
             // As in `copy_back`: the card's byte where it is not what it
             // was before the submission, else the title's.
-            let mut differs = 0u8;
-            for ((t, g), o) in title.iter_mut().zip(gpu).zip(old.iter_mut()) {
+            let mut differs = 0u64;
+            let (gw, tw) = (gpu.as_chunks::<8>().0, title.as_chunks::<8>().0);
+            let whole = gw.len().min(tw.len()).min(old.as_chunks::<8>().0.len()) * 8;
+            let mut i = 0;
+            while i < whole {
+                let g = u64::from_le_bytes(gpu[i..i + 8].try_into().unwrap());
+                let o = u64::from_le_bytes(old[i..i + 8].try_into().unwrap());
+                let t = u64::from_le_bytes(title[i..i + 8].try_into().unwrap());
+                let (_, merged) = merge_word(g, o, t);
+                differs |= merged ^ t;
+                title[i..i + 8].copy_from_slice(&merged.to_le_bytes());
+                old[i..i + 8].copy_from_slice(&merged.to_le_bytes());
+                i += 8;
+            }
+            for ((t, g), o) in title[i..].iter_mut().zip(gpu[i..].iter()).zip(old[i..].iter_mut()) {
                 let wrote = if *g != *o { 0xffu8 } else { 0 };
                 let merged = (*t & !wrote) | (*g & wrote);
-                differs |= merged ^ *t;
+                differs |= u64::from(merged ^ *t);
                 *t = merged;
                 *o = merged;
             }
