@@ -22,6 +22,30 @@ second déclencheur `defer_host_read` (re-gating externe seulement, jamais
 naïf — voir suspect #3), (c) vérifier si `LATE_WAIT=3` tient maintenant —
 le stage-3 peut être le même UAF exposé par un timing différent.
 
+## V5.8 — session Astra interrompue, aucun code retenu ; données utiles
+
+Rien à réintégrer (restore == `65d80d3` partout). Depuis les logs : la fixture
+`translated_graphics` échoue **en bac à sable** (`Present=0x087A0001`
+occlusion) mais passe 3× sur bureau interactif (144 fps, 64/64) — attendu, pas
+un bug. Benchs : plaincopy amélioré 12,7× @4 Kio ; VALU 17/17.
+
+**Fixture `animation_transition` livrée** (Devin, `644e4d2`) : crossfade A→B
+sur RT intermédiaire + staging present + history texture + oracle byte-exact
+→ 79/80 distincts, convergence exacte vers scène B. Pièges consignés :
+double-write CPU d'un VB upload (race GPU) et présents occlus droppés
+(fenêtre topmost obligatoire pour les stats).
+
+**Pour la prochaine session Astra** — priorités ciblées :
+
+1. **Stage-3 / LATE_WAIT=3** : rejouer sous `f8c897c` — la fence UAF est
+   corrigée ; si le hang persiste, le suspect restant est le domaine
+   `late_free_present`/`FrameLimit` (design Kelvaroq extrait dans
+   KELVAROQ-INTEGRATION-ROADMAP phase 2 : `Held::Present` en file + borne par
+   atterrissage de copie — un design alternatif au slot `p.ahead`+sweep).
+2. **wait-GPU sous lock `submitted`** (B2) : mesurer via `frame_wait`-style
+   instrumentation (Kelvaroq 0046 montre le format) avant tout retrait.
+3. `defer_host_read` externe-only : seulement après 1.
+
 ## V5.6 — donnée nouvelle : le crash est aussi atteignable sous `LATE_WAIT=2`
 
 Table 2×2 des runs V5.5-V5.6 (même save, même scène, `LATE_WAIT=2`) :
