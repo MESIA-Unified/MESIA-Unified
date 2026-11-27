@@ -263,3 +263,41 @@ maintenant que v2/v3 sont en place, `MESIA_LATE_WAIT_LISTS` réglage.
 - **Mission 6** : design async present borné Kelvaroq extrait (`Held::Present` en file + `FrameLimit` pacing par atterrissage de copie, `frame_wait` comme modèle d'instrumentation) → section roadmap phase 2.
 - **Mission 7** : attentes superflues — fixture : la seule attente = vsync+fence (légitime) ; moteur : le wait-GPU-sous-`submitted` reste le candidat architectural connu (B2, handoff).
 - Commits : code de `65d80d3` inchangé ; docs + fixture à committer.
+
+## 27 novembre 2026 (nuit) — V5.9 : campagne perf autonome — cycle 1 (merges u64) + baseline
+
+**Base `d552f40`.** Objectif exploratoire 10 FPS ; machine RTX 3060 12 Go / 16 Go RAM.
+
+**Baseline** (LATE_WAIT=2, in-world, zone lourde) : P50=619 ms, P95=1154. Ventilation :
+copies ~125 ms/~200 Mo up, textures ~4-10 ms, **~200-215 ms sur le GPU**,
+copy-back ~78-81 ms/~70 Mo, attente carte ~210 ms, heap-buffers pass ~81-133 ms.
+
+**LATE_WAIT=3 re-testé sous f8c897c** : crash persiste à l'entrée du monde
+(0x887A0006, signatures « 3 ahead of 9 lists », « 13 of 76 ») → le résiduel
+stage-3 est un bug DISTINCT de l'UAF fence corrigée. Concurrency gates gelées.
+
+**Cycle 1 — vectorisation merges (`58f13c9`)** : `merge_word` u64 partagé
+(shift-chain → masque par lane ×0xff) appliqué à `merge_piece`, `card_merge`,
+inner loop `copy_back`. Octets produits identiques (oracles byte-exact verts,
+138 tests). Bench `heavy_frames` : chemin wide ~1,09 s → ~1,09 s — **gain nul
+sur bench** (boucle sans branche déjà auto-vectorisée par LLVM probablement).
+Conservé : cohérence avec `first_difference`/`last_difference`, indépendance
+de l'auto-vec. In-world A/B : P50 619 → 546 ms, P95 1154 → 1002 (**-12 %
+médian**, dans le bruit de zone — direction positive, non attribuable seul).
+
+**Incident** : 1er run post-change DEVICE_REMOVED à l'entrée monde
+(LATE_WAIT=2, 0x887A0006, no breadcrumbs, « 4 ahead of 10 lists ») — même
+résiduel non déterministe que stage-3, non imputable aux merges (octets
+identiques). 2e run a passé l'entrée, soak >6 min 0 removed.
+
+**Tableau progression §25**
+
+| commit | ms/frame avant | ms/frame après | P95 | stabilité | tests | décision | prochain goulet |
+|--------|---------------|----------------|-----|-----------|-------|----------|-----------------|
+| 58f13c9 | P50 619 | P50 546 | 1002 vs 1154 | 1 crash entrée monde (non déterministe), 1 soak >6 min OK | 138 verts | conservé (cohérence, gain ≈ bruit) | attente carte ~210 ms / copies 125 ms — leviers risqués (fetch send-tôt/wait-tard, LATE_WAIT_LISTS) ou scan CPU heap-buffers |
+
+**État backlog revu** : `card_back` utilise DÉJÀ `merge_groups` + `wide_merge`
+(host.rs:4204) — la note « 8 groupes sans union-find » était périmée. Restants :
+fetch `card_back` synchrone (send-tôt/wait-tard, ~20-80 ms, risque B),
+`MESIA_LATE_WAIT_LISTS` réglage, PIECE 64 Kio → plus petit (payoff incertain :
+fetch pleine pièce vs +8× dispatches), wait-GPU-sous-`submitted` (B2).
