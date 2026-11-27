@@ -253,3 +253,13 @@ maintenant que v2/v3 sont en place, `MESIA_LATE_WAIT_LISTS` réglage.
 - **Hypothèse active** : l'UAF de fence différée est un candidat de cause racine du résiduel timing-sensible — les déclencheurs (plaincopy, gating) accélèrent la préparation et décalent la fenêtre relâche/consomme.
 - **Test en cours** : run repro `MESIA_COPY_PLAIN=1` (crashait ~3 min sous l'ancien binaire) sous le nouveau.
 - **Commits** : `f8c897c` (récupération code), `4bf43f1` (docs dérivés + wer.ps1). Rapport : `docs/ASTRA-V57-RECOVERY-REPORT.md`.
+
+## 27 novembre 2026 — V5.8 : récupération Astra (rien retenu) + fixture animation_transition livrée
+
+**Base `65d80d3`.** Session Codex interrompue ; restore `.restore-v58-*` = état identique à `65d80d3` partout (code, docs, `integration/`) → **aucune modification retenue de V5.8** (revertée ou jamais appliquée). Ni branche `campaign/v5.8` ni nouveaux commits n'existent.
+
+- **Conclusions sous-agents récupérées** (logs dans le restore) : `gfx-1` échec bac à sable `Present=0x087A0001` (occlusion) puis `desktop-gfx-1/2/3` verts (64/64 exacts, `present_fps≈144`, `wait_ms 6,54/6,94` = vsync légitime) ; `plain-1/2/3` bench amélioré (12,7× @4 Kio) ; `valu` 17/17.
+- **Fixture `animation_transition` implémentée et verte** : crossfade A→B (3 PSOs GFX10 dérivées, BLEND_FACTOR par draw), feedback temporel accumulatif, RT intermédiaire→staging present, RT history persistante vérifiée, oracle récursif u8 (tolérance ±1 flaggée aux égalités x.5 seulement), convergence **byte-exact** vers la scène B prouvée. Pièges : 2 VBs nécessaires (double-write CPU race le GPU), `HWND_TOPMOST` requis (presents occlus droppés). Résultat : `distinct=79/80, observed_ids=71`.
+- **Mission 6** : design async present borné Kelvaroq extrait (`Held::Present` en file + `FrameLimit` pacing par atterrissage de copie, `frame_wait` comme modèle d'instrumentation) → section roadmap phase 2.
+- **Mission 7** : attentes superflues — fixture : la seule attente = vsync+fence (légitime) ; moteur : le wait-GPU-sous-`submitted` reste le candidat architectural connu (B2, handoff).
+- Commits : code de `65d80d3` inchangé ; docs + fixture à committer.

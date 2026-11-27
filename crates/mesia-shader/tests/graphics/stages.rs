@@ -135,6 +135,36 @@ pub fn translated_stages() -> (HostShader, HostShader) {
     (vs, ps)
 }
 
+/// Same opaque pixel program as `translated_stages` but the mrt0 export's four
+/// lanes are selected by `word` (one byte per lane: R, G, B, A). v0 = 1.0 and
+/// v1 = 0, so e.g. `0x0000_0001` exports opaque cyan (v1,v0,v0,v0) and
+/// `0x0001_0000` opaque yellow (v0,v0,v1,v0). Used by the animation/transition
+/// fixture for scene-B colours.
+pub fn translated_ps_export(word: u32) -> HostShader {
+    const PATCH_TABLE: usize = 0x14c;
+    const PATCH_BYTES: usize = 4 + 10 * 10 * 4;
+    let mut ps_metadata = vec![0; PATCH_TABLE + 8 * PATCH_BYTES];
+    for mrt in 0..8 {
+        put32(&mut ps_metadata, PATCH_TABLE + mrt * PATCH_BYTES, u32::MAX);
+    }
+    let ps = native_part(
+        0x30,
+        &ps_metadata,
+        &[
+            0x7e00_02f2, // v_mov_b32 v0, 1.0
+            0x7e02_0280, // v_mov_b32 v1, 0
+            0xf800_180f,
+            word, // exp mrt0 r,g,b,a done vm
+            0xbf81_0000, // s_endpgm
+        ],
+    );
+    translate(&container(&[
+        (b"DXIL", ps),
+        (b"OSG1", signature("SV_Target", 64, false)),
+    ]))
+    .expect("translate original colour export")
+}
+
 /// Validate copies, so the PSO receives exactly the bytes emitted by MESIA.
 pub fn validate_stages(vs: &HostShader, ps: &HostShader) {
     use mesia_shader::emit::validator::Validator;

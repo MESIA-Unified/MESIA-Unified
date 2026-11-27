@@ -44,6 +44,32 @@ si le DEVICE_HUNG persiste sous file bornée, le suspect sweep/`host.state` rest
 En parallèle : instrumenter d'abord les compteurs descripteurs (slots inspectés/changés)
 avant de porter 0055 — ne porter que si le poste est mesuré significatif.
 
+**Design extrait (V5.8, lecture directe des patches)** — async present borné,
+principes publics transférables :
+
+- `async_present()` : le `Present` du titre retourne immédiatement ; le present
+  réel est enfilé comme `Held::Present(Box<closure>)` sur la file d'opérations
+  retenues de la queue — le titre enregistre la frame suivante pendant que le
+  worker présente la courante. Actif par défaut (`VICTORY_ASYNC_PRESENT=0`
+  désactive) ; requiert `behind()` + `late_free_present()`.
+- `FrameLimit` (mutex+condvar) : chaque frame en file occupe un **slot de
+  pacing** jusqu'à ce que sa copie atterrisse — `frames_ahead()` borné
+  (`FRAMES_AHEAD=2`, clamp 1-8). La borne est *temporelle* (atterrissage de la
+  copie), pas seulement un compteur de vols.
+- Invariants clés : seules la texture et les listes fermées sont retenues pour
+  le present différé ; un titre réutilisant leur stockage attend sa fence
+  comme avant ; le refresh ordinaire au submit voit encore les écritures titre.
+- `frame_wait` (0046) : instrumentation `Call::Pacing`/`FenceLanding`/locks par
+  étape — leurs chiffres (RTX 5080) : temps titre dans Present → 0,1 ms/frame,
+  p50 lourd 115,5→108,5 ms, p95 568→262 ms ; le thread de soumission devient
+  le chemin critique.
+- **Équivalence MESIA** : notre `late_free_present` envoie déjà la copie
+  present en vol via `execute_own` ; ce qui manque vs leur design = la borne
+  `FrameLimit` par atterrissage de copie et le `Present` DXGI lui-même en file
+  (chez nous `queue::present` release seulement). Leur `frame_wait` est aussi
+  le modèle pour instrumenter nos attentes (mission 7 : wait sous lock
+  `submitted` = candidat connu).
+
 **Phase 3 — copy-back GPU patch + mesh launch** (M, risque B-C) : `relay_patch` 0057
 (copy-back 78-173 ms → cible ~15 ms équivalent chez eux) puis `launch` 0041 si le
 comptage de draws mesh indirects le justifie. Les deux demandent des chemins GPU

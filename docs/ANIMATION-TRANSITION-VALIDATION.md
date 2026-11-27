@@ -16,7 +16,30 @@ uniquement (fixtures GFX10 synthétiques du dépôt).
 | Conformité ALU | 17 tests VALU GFX10 | opérations scalaires/vectorielles traduites, résultats exacts |
 | Fraîcheur des données in-world | soak `LATE_WAIT=2` (11 h puis 50 min) | scène 3D animée continue (personnages, véhicules, trafic), captures horodatées distinctes et cohérentes |
 
-## 2. Écarts à couvrir (fixture `animation_transition` à écrire)
+## 2. Implémenté (V5.8) — `tests/animation_transition.rs`
+
+**Résultat (release, RTX 3060, fenêtre topmost)** : `frames=80, distinct=79,
+tie_pixels=17128, observed_ids=71, transitions=1, converge=exact` — test vert.
+
+| Écart | Implémentation |
+|---|---|
+| Constante d'animation | `OMSetBlendFactor` par draw (facteurs exacts en binaire) + VB réécrit par frame |
+| Transition A→B + fondu | 3 PSOs (magenta/cyan/jaune — programmes GFX10 dérivés, `translated_ps_export`), crossfade SrcBlend=BLEND_FACTOR sur 8 frames ; **convergence prouvée** : dernière frame accumulée == première frame cleared scène B, byte-exact |
+| Historique d'image | RT `history` (COMMON) recevant `CopyResource` les frames paires ; readback les frames impaires vérifie la rétention exacte sur une frame de travail |
+| Flou de mouvement / interpolation | passe plein écran `lerp(dst, cyan, bf)` — feedback temporel sur l'image accumulée (traîne qui décroît) ; **le flou disparaît exactement** (bf=1 final) |
+| Textures intermédiaires | rendu dans RT intermédiaire → `CopyResource`→back buffer = le staging de present du moteur |
+| Post-traitement | la passe plein écran blendée = post-process sur texture intermédiaire |
+| Animation caméra/géométrie | trajectoire rect A (slide) → B (inversée, haute) à K1 = entrée simulée |
+| Oracle récursif | u8 exact ; seule tolérance ±1 ulp flaggée pixel par pixel quand le résultat rationnel tombe sur une égalité de représentation (x.5) |
+
+Pièges rencontrés et documentés : double écriture CPU d'un VB upload entre
+deux draws de la même liste (le GPU lit à l'exécution → 2 buffers séparés) ;
+presents flip droppés sous occlusion (`HWND_TOPMOST` requis pour les stats).
+
+Couverture supplémentaire vs spec : le « key press » est l'index K1 (comme
+spécifié §3) ; la vraie chaîne input→état reste en observation en jeu.
+
+## 2a. Spécification originale (référence)
 
 Prolonger `translated_graphics.rs` — même squelette D3D12/DXGI, oracle CPU.
 
